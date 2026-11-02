@@ -8,6 +8,7 @@ const VaultProxy = artifacts.require("VaultProxy");
 const IUpgradeableStrategy = artifacts.require("IUpgradeableStrategy");
 const ILiquidatorRegistry = artifacts.require("IUniversalLiquidatorRegistry");
 const IDex = artifacts.require("IDex");
+const IAeroV2Dex = artifacts.require("IAeroV2Dex");
 const IERC721 = artifacts.require("IERC721");
 const IncentivesGeneral = artifacts.require("IncentivesGeneral");
 
@@ -131,6 +132,12 @@ async function setupCoreProtocol(config) {
     const dex = await IDex.at("0x63dFe27676d53f24E251CbBc0E37ffDC856319a2");
     for (i=0;i<config.aeroSetup.length;i++) {
       await dex.pairSetup(config.aeroSetup[i][0], config.aeroSetup[i][1], config.aeroSetup[i][2], config.aeroSetup[i][3], {from: config.ULOwner})
+    }
+  }
+  if(config.aeroV2Setup) {
+    const dex = await IAeroV2Dex.at("0x6141Cacd5C7752ab0813347Ef87179e46c1c35Fc");
+    for (i=0;i<config.aeroV2Setup.length;i++) {
+      await dex.pairSetup(config.aeroV2Setup[i][0], config.aeroV2Setup[i][1], config.aeroV2Setup[i][2], {from: config.ULOwner})
     }
   }
 
