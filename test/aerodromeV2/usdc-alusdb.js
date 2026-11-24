@@ -127,6 +127,21 @@ function laterSettleRevertsCode(copy) {
     + "5b" + "63deadbeef60e01b60005260046000fd"; // 0x97: revert with 0xdeadbeef
 }
 
+// code for a pool whose mint fails with 0xdeadbeef, or as `failure` does (code such as emptyRevertCode, which runs from
+// the mint's JUMPDEST at 0x48, the end of this code, so it moves no offset). In a hard work only the strategy's compounding
+// mints LP (the AERO sale only swaps through the pools), so this fails the compounding alone. Any other call runs the
+// pool's own code, copied to `copy`, through DELEGATECALL, in the pool's own storage
+function mintRevertsCode(copy, failure = revertingCode) {
+  let mint = web3.eth.abi.encodeFunctionSignature("mint(address)").slice(2);
+  return "0x"
+    + "600035" + "60e01c" + "63" + mint + "14" + "610048" + "57" // selector == mint: jump to 0x48
+    + "5b" + "36" + "6000" + "6000" + "37" // 0x10: calldatacopy(0, 0, calldatasize)
+    + "6000" + "6000" + "36" + "6000" + "73" + copy.slice(2).toLowerCase() + "5a" + "f4" // delegatecall(gas, copy, ...)
+    + "3d60006000" + "3e" + "610043" + "57" + "3d6000fd" // returndatacopy; revert with it on failure ...
+    + "5b" + "3d6000f3" // 0x43: ... else return it
+    + "5b" + failure.slice(2); // 0x48: mint: revert (by default with 0xdeadbeef)
+}
+
 // Developed and tested at blockNumber 53206000
 
 // Vanilla Mocha test. Increased compatibility with tools that integrate Mocha.
@@ -170,6 +185,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
   let aeroV2Dex = "0x6141Cacd5C7752ab0813347Ef87179e46c1c35Fc"; // UniversalLiquidator dex for Aero basic pools (registry key "aero")
   let zeroAddress = "0x0000000000000000000000000000000000000000";
   let leafVoterCopy = "0x00000000000000000000000000000000c0de1eaf"; // no code at the fork: holds a copy of the LeafVoter's code
+  let poolCopy = "0x00000000000000000000000000000000c0de9001"; // no code at the fork: holds a copy of the pool's code
   let secondGaugeAddress; // the pool's second gauge, deployed by the test that moves the stake to it
   // Stable gauges have their own gauge factory (0x1e0f776E...7800, not the volatile one's); at this block the same Aero
   // Safes hold the roles we need on it (RoleGranted/RoleRevoked logs, confirmed with hasRole)
@@ -392,6 +408,24 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
     return new BigNumber(lp).times(await dollars(reserves[0].toString(), reserves[1].toString())).idiv(await pool.totalSupply());
   }
 
+  // the reward sale of the hard work in `block`: the AERO it took the fee on (its one ProfitLogInReward), the fee (its one
+  // AERO transfer to the reward forwarder), and the AERO it sold (its other AERO transfers, to the liquidator's dex: a
+  // share for each pool token, neither being AERO), next to what the fee left of the fee base, which it should all sell
+  async function rewardSale(block) {
+    let profits = await strategyEvents(profitLogInReward, block);
+    assert.equal(profits.length, 1, "should take the fee once");
+    let feeBase = new BigNumber(profits[0].args.profitAmount.toString());
+    let forwarder = (await controller.rewardForwarder()).toLowerCase();
+    let aeroOut = await aeroToken.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block });
+    let fees = aeroOut.filter(transfer => transfer.args.to.toLowerCase() == forwarder);
+    assert.equal(fees.length, 1, "the fee should go to the reward forwarder");
+    let fee = new BigNumber(fees[0].args.value.toString());
+    let sales = aeroOut.filter(transfer => transfer.args.to.toLowerCase() != forwarder);
+    assert.equal(sales.length, 2, "the sales of the USDC and the alUSDb shares should go through the liquidator");
+    return { feeBase: feeBase, fee: fee, split: feeBase.minus(fee),
+      sold: sales.reduce((total, sale) => total.plus(sale.args.value.toString()), new BigNumber(0)) };
+  }
+
   // farmer2 burns a part of its LP (1/`divisor`) for the pool tokens behind it; returns what it got [USDC, alUSDb]
   async function burnLP(divisor) {
     let before = [new BigNumber(await usdcToken.balanceOf(farmer2)), new BigNumber(await alusdbToken.balanceOf(farmer2))];
@@ -421,8 +455,9 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
     return await gaugeDepositFor.methods.depositFor(amount, strategy.address).send({ from: outsider, gas: 1000000 });
   }
 
-  // the gas a best-effort gauge exit (emergencyExit, leaving a switched-off gauge) must have left when it starts:
-  // gaugeTapeGasLimit + 1,000,000 for the gauge withdraw, + 200,000 kept back for the emergencyWithdraw fallback
+  // the gas a best-effort gauge exit (emergencyExit, and the hard work's exit from a gauge Aero switched off or while
+  // keepUnstaked is on) must have left when it starts: gaugeTapeGasLimit + 1,000,000 for the gauge withdraw, + 200,000
+  // kept back for the emergencyWithdraw fallback
   async function exitGasFloor() {
     return Number((await gaugeFactory.gaugeTapeGasLimit()).toString()) + 1200000;
   }
@@ -469,6 +504,24 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       return await withLeafVoterCode(laterSettleRevertsCode(leafVoterCopy), fn);
     } finally {
       await hre.network.provider.send("hardhat_setCode", [leafVoterCopy, "0x"]);
+    }
+  }
+
+  // runs `fn` while every mint of the pool fails with 0xdeadbeef, or as the code `failure` does (mintRevertsCode), and the
+  // pool's own code comes back afterwards
+  async function withPoolMintFailing(fn, failure = revertingCode) {
+    let poolCode = await web3.eth.getCode(underlying.address);
+    assert.equal(await web3.eth.getCode(poolCopy), "0x", "the copy should go to an address without code");
+    await hre.network.provider.send("hardhat_setCode", [poolCopy, poolCode]);
+    try {
+      await hre.network.provider.send("hardhat_setCode", [underlying.address, mintRevertsCode(poolCopy, failure)]);
+      try {
+        return await fn();
+      } finally {
+        await hre.network.provider.send("hardhat_setCode", [underlying.address, poolCode]);
+      }
+    } finally {
+      await hre.network.provider.send("hardhat_setCode", [poolCopy, "0x"]);
     }
   }
 
@@ -564,6 +617,8 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
     // a new strategy has never staked, and stakes at most once per minStakeInterval (about a day of 0.2 s blocks)
     assert.equal((await strategy.minStakeInterval()).toString(), "432000", "the default minStakeInterval");
     assert.equal((await strategy.lastStakeBlock()).toString(), "0", "a new strategy has never staked");
+    assert.equal(await strategy.keepUnstaked(), false, "a new strategy stakes its LP: governance has not kept it unstaked");
+    assert.equal((await strategy.feePaidReward()).toString(), "0", "a new strategy holds no AERO whose fee was taken");
     // most describes test the window logic on its own; the "Minimum stake interval" describe restores the default and
     // tests the interval
     await strategy.setMinStakeInterval(0, { from: governance });
@@ -647,47 +702,237 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
   });
 
   describe("User deposits and withdrawals", function() {
-    it("Never reach the gauge: the vault's doHardWork is ignored while investOnDeposit is on", async function() {
-      // the vault default: user deposits run the strategy's doHardWork
+    // the strategy's error for a hard work that the vault runs while it runs hard works for users
+    let flagsOn = "investOnDeposit or compoundOnWithdraw is on";
+
+    // what a user deposit or withdrawal that reverts must leave as it was: the user's LP and shares, the vault, the
+    // strategy and its stake
+    async function userState(user) {
+      return {
+        userLP: (await underlying.balanceOf(user)).toString(),
+        userShares: (await vault.balanceOf(user)).toString(),
+        totalShares: (await vault.totalSupply()).toString(),
+        vaultLP: (await vault.underlyingBalanceInVault()).toString(),
+        strategyLP: (await underlying.balanceOf(strategy.address)).toString(),
+        strategyAero: (await aeroToken.balanceOf(strategy.address)).toString(),
+        staked: (await gauge.balanceOf(strategy.address)).toString(),
+        rewardPerTokenPaid: (await gauge.userRewardPerTokenPaid(strategy.address)).toString(), // nothing claimed
+        depositBlock: (await gauge.depositBlock(strategy.address)).toString(),
+        lastStakeBlock: (await strategy.lastStakeBlock()).toString(),
+      };
+    }
+
+    // governance calls the strategy's doHardWork itself, not through the vault: with AERO to claim (and minStakeInterval 0,
+    // root before()) it claims, sells, compounds and stakes what it compounded
+    async function governanceHardWork() {
+      let idle = new BigNumber(await underlying.balanceOf(strategy.address));
+      let tx = await strategy.doHardWork({ from: governance, gasPrice: keeperGasPrice });
+      let block = tx.receipt.blockNumber;
+      assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 1, "governance's own hard work should claim");
+      assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "governance's own hard work should sell the AERO");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "governance's own hard work should stake");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), idle.plus(minted));
+      return block;
+    }
+
+    it("Never reach the gauge: a user deposit reverts while investOnDeposit is on, and so does the keeper's hard work through the vault, while governance's own runs and user withdrawals go through", async function() {
+      // a stake for the hard works below to claim from: half of farmer1's LP, deposited with the flag off (root before())
+      // and staked by the keeper
+      let amount = new BigNumber(await underlying.balanceOf(farmer1)).div(2).integerValue(BigNumber.ROUND_DOWN);
+      await depositVault(farmer1, underlying, vault, amount.toFixed());
+      let block = await doHardWork();
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "keeper hard work should stake");
+      Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+      await mineBlocks(600); // AERO to claim
+
+      // the vault default: user deposits run the strategy's doHardWork, where each deposit would restart the penalty
+      // window. The strategy refuses it, so a user deposit reverts as a whole and changes nothing
       await vault.setInvestOnDeposit(true, { from: governance });
       try {
-        let amount = new BigNumber(await underlying.balanceOf(farmer1)).div(2).integerValue(BigNumber.ROUND_DOWN);
-        await underlying.approve(vault.address, amount.toFixed(), { from: farmer1 });
-        let tx = await vault.deposit(amount.toFixed(), farmer1, { from: farmer1 });
-        assert.equal((await strategyEvents("HardWorkSkipped", tx.receipt.blockNumber)).length, 1, "user deposit should not run the hard work");
-        assert.equal((await gaugeEvents("Deposit", tx.receipt.blockNumber)).length, 0, "user deposit should not reach the gauge");
+        let deposit = amount.div(10).integerValue(BigNumber.ROUND_DOWN).toFixed();
+        await underlying.approve(vault.address, deposit, { from: farmer1 });
+        let before = await userState(farmer1);
+        let message = await revertMessage(vault.deposit(deposit, farmer1, { from: farmer1 }), "a user deposit should revert while investOnDeposit is on");
+        assert.include(message, flagsOn);
+        assert.deepEqual(await userState(farmer1), before, "a user deposit that reverts should change nothing");
 
-        // the keeper also comes through the vault, so it is silenced too: the flag must be turned off at deployment
-        let block = await doHardWork();
-        assert.equal((await strategyEvents("HardWorkSkipped", block)).length, 1, "keeper hard work should be skipped");
-        Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+        // the keeper also comes through the vault, so its hard work reverts too, loudly instead of silently compounding
+        // nothing while the flag is on: the flag must be turned off at deployment
+        message = await revertMessage(controller.doHardWork(vault.address, { from: governance, gasPrice: keeperGasPrice }),
+          "the keeper's hard work through the vault should revert while investOnDeposit is on");
+        assert.include(message, flagsOn);
+        assert.deepEqual(await userState(farmer1), before, "a keeper hard work that reverts should change nothing");
+
+        // governance calling the strategy itself is not the vault: its hard work runs
+        await governanceHardWork();
+
+        // and users can still leave: a withdrawal runs no hard work while only investOnDeposit is on (compoundOnWithdraw
+        // would run one), so it is paid in full, here from the gauge, which holds all the LP
+        assert.equal(await vault.investOnDeposit(), true);
+        assert.equal(await vault.compoundOnWithdraw(), false);
+        Utils.assertBNEq(await unstakedLP(), 0);
+        let shares = new BigNumber(await vault.balanceOf(farmer1)).div(10).integerValue(BigNumber.ROUND_DOWN);
+        let expected = new BigNumber(await vault.underlyingBalanceWithInvestment()).times(shares).idiv(await vault.totalSupply());
+        let farmerBefore = new BigNumber(await underlying.balanceOf(farmer1));
+        let sharesBefore = new BigNumber(await vault.balanceOf(farmer1));
+        let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        let tx = await vault.withdraw(shares.toFixed(), { from: farmer1 });
+        let withdrawal = tx.receipt.blockNumber;
+        Utils.assertBNGt(expected, 0);
+        Utils.assertBNEq(new BigNumber(await underlying.balanceOf(farmer1)).minus(farmerBefore), expected);
+        Utils.assertBNEq(sharesBefore.minus(await vault.balanceOf(farmer1)), shares);
+        let withdrawn = await gaugeEvents("Withdraw", withdrawal);
+        assert.equal(withdrawn.length, 1, "the withdrawal should be paid from the gauge");
+        Utils.assertBNEq(withdrawn[0].args._amount.toString(), expected);
+        // nothing is staked, sold or compounded in it. The gauge's withdraw pays out the AERO the stake earned
+        // (EmissionsClaimed), which waits in the strategy, unsold, for the next hard work
+        assert.equal((await gaugeEvents("Deposit", withdrawal)).length, 0, "a user withdrawal should not stake");
+        assert.equal((await strategyEvents(profitLogInReward, withdrawal)).length, 0, "a user withdrawal should not sell");
+        assert.equal((await poolEvents("Mint", withdrawal, strategy.address)).length, 0, "a user withdrawal should not compound");
+        let paid = (await gaugeEvents("EmissionsClaimed", withdrawal))
+          .reduce((total, claim) => total.plus(claim.args._rewardAmount.toString()), new BigNumber(0));
+        console.log("user withdrawal while investOnDeposit is on: LP ", expected.toFixed(), " AERO the gauge paid out with it: ", paid.toFixed());
+        Utils.assertBNGt(paid, 0);
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), aeroBefore.plus(paid));
       } finally {
         await vault.setInvestOnDeposit(false, { from: governance });
       }
 
-      let block = await doHardWork();
+      // with the flag off, the keeper's hard work through the vault runs again
+      block = await doHardWork();
+      assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 1, "keeper hard work should claim");
       assert.equal((await gaugeEvents("Deposit", block)).length, 1, "keeper hard work should stake");
       Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
     });
 
-    it("Never reach the gauge: the vault's doHardWork is ignored while compoundOnWithdraw is on", async function() {
+    it("Never reach the gauge: a user withdrawal reverts while compoundOnWithdraw is on, and goes through once governance turns it off", async function() {
       // with compoundOnWithdraw on, every user withdrawal runs the strategy's doHardWork
       await vault.setCompoundOnWithdraw(true, { from: governance });
+      let shares;
       try {
         assert.equal(await vault.compoundOnWithdraw(), true);
-        assert.equal(await vault.investOnDeposit(), false, "only compoundOnWithdraw should call for the skip");
+        assert.equal(await vault.investOnDeposit(), false, "only compoundOnWithdraw should call for the revert");
 
-        // a deposit waits in the vault, and a smaller withdrawal is paid from it: only the hard work could reach the gauge
+        // a deposit (no hard work with investOnDeposit off) waits in the vault, and a smaller withdrawal would be paid from
+        // it: only the hard work inside it could reach the gauge. The strategy refuses that hard work, so the withdrawal
+        // reverts as a whole and changes nothing: withdrawals fail closed until governance turns the flag off
         let amount = new BigNumber(await underlying.balanceOf(farmer1)).div(10).integerValue(BigNumber.ROUND_DOWN);
         await depositVault(farmer1, underlying, vault, amount.toFixed());
-        let shares = amount.div(2).times(await vault.totalSupply()).idiv(await vault.underlyingBalanceWithInvestment());
-        let tx = await vault.withdraw(shares.toFixed(), { from: farmer1 });
-        assert.equal((await gaugeEvents("Withdraw", tx.receipt.blockNumber)).length, 0, "the withdrawal should be paid from the vault");
-        assert.equal((await strategyEvents("HardWorkSkipped", tx.receipt.blockNumber)).length, 1, "user withdrawal should not run the hard work");
-        assert.equal((await gaugeEvents("EmissionsClaimed", tx.receipt.blockNumber)).length, 0, "user withdrawal should not claim");
-        assert.equal((await gaugeEvents("Deposit", tx.receipt.blockNumber)).length, 0, "user withdrawal should not reach the gauge");
+        shares = amount.div(2).times(await vault.totalSupply()).idiv(await vault.underlyingBalanceWithInvestment());
+        let before = await userState(farmer1);
+        let message = await revertMessage(vault.withdraw(shares.toFixed(), { from: farmer1 }), "a user withdrawal should revert while compoundOnWithdraw is on");
+        assert.include(message, flagsOn);
+        assert.deepEqual(await userState(farmer1), before, "a user withdrawal that reverts should change nothing");
+
+        // so does the keeper's hard work through the vault
+        message = await revertMessage(controller.doHardWork(vault.address, { from: governance, gasPrice: keeperGasPrice }),
+          "the keeper's hard work through the vault should revert while compoundOnWithdraw is on");
+        assert.include(message, flagsOn);
+        assert.deepEqual(await userState(farmer1), before, "a keeper hard work that reverts should change nothing");
+
+        // while governance's own hard work runs; the deposit still waits in the vault, which only its own hard work invests
+        await mineBlocks(600); // AERO to claim
+        await governanceHardWork();
+        Utils.assertBNEq(await vault.underlyingBalanceInVault(), before.vaultLP);
       } finally {
         await vault.setCompoundOnWithdraw(false, { from: governance });
+      }
+
+      // with the flag off, the same withdrawal goes through, paid from the vault: nothing reaches the gauge
+      let expected = new BigNumber(await vault.underlyingBalanceWithInvestment()).times(shares).idiv(await vault.totalSupply());
+      let farmerBefore = new BigNumber(await underlying.balanceOf(farmer1));
+      let sharesBefore = new BigNumber(await vault.balanceOf(farmer1));
+      let tx = await vault.withdraw(shares.toFixed(), { from: farmer1 });
+      Utils.assertBNEq(new BigNumber(await underlying.balanceOf(farmer1)).minus(farmerBefore), expected);
+      Utils.assertBNEq(sharesBefore.minus(await vault.balanceOf(farmer1)), shares);
+      assert.equal((await gaugeEvents("Withdraw", tx.receipt.blockNumber)).length, 0, "the withdrawal should be paid from the vault");
+      assert.equal((await gaugeEvents("EmissionsClaimed", tx.receipt.blockNumber)).length, 0, "user withdrawal should not claim");
+      assert.equal((await gaugeEvents("Deposit", tx.receipt.blockNumber)).length, 0, "user withdrawal should not reach the gauge");
+    });
+
+    it("Never reach the gauge with both flags on: a user deposit, a user withdrawal and the keeper's hard work through the vault all revert, while governance's own runs go through", async function() {
+      // each flag alone makes every hard work the vault runs revert (the tests above), and both together must too: a check
+      // in which the two flags cancel out would let user deposits and withdrawals run the hard work into the gauge. A
+      // deposit with both flags off waits in the vault, so that a smaller withdrawal would be paid from it
+      let amount = new BigNumber(await underlying.balanceOf(farmer1)).div(10).integerValue(BigNumber.ROUND_DOWN);
+      await depositVault(farmer1, underlying, vault, amount.toFixed());
+      await mineBlocks(600); // AERO to claim
+      let shares = amount.div(2).times(await vault.totalSupply()).idiv(await vault.underlyingBalanceWithInvestment());
+      await vault.setInvestOnDeposit(true, { from: governance });
+      try {
+        await vault.setCompoundOnWithdraw(true, { from: governance });
+        try {
+          assert.equal(await vault.investOnDeposit(), true);
+          assert.equal(await vault.compoundOnWithdraw(), true);
+          let deposit = amount.div(10).integerValue(BigNumber.ROUND_DOWN).toFixed();
+          await underlying.approve(vault.address, deposit, { from: farmer1 });
+          let before = await userState(farmer1);
+
+          // a user deposit runs the strategy's doHardWork (investOnDeposit): the strategy refuses it, so the deposit reverts
+          // as a whole and changes nothing
+          let message = await revertMessage(vault.deposit(deposit, farmer1, { from: farmer1 }), "a user deposit should revert while both flags are on");
+          assert.include(message, flagsOn);
+          assert.deepEqual(await userState(farmer1), before, "a user deposit that reverts should change nothing");
+
+          // so does a user withdrawal (compoundOnWithdraw), which the LP waiting in the vault would pay: only the hard work
+          // inside it could reach the gauge
+          Utils.assertBNGt(before.vaultLP, new BigNumber(await vault.underlyingBalanceWithInvestment()).times(shares).idiv(await vault.totalSupply()));
+          message = await revertMessage(vault.withdraw(shares.toFixed(), { from: farmer1 }), "a user withdrawal should revert while both flags are on");
+          assert.include(message, flagsOn);
+          assert.deepEqual(await userState(farmer1), before, "a user withdrawal that reverts should change nothing");
+
+          // and the keeper's hard work through the vault
+          message = await revertMessage(controller.doHardWork(vault.address, { from: governance, gasPrice: keeperGasPrice }),
+            "the keeper's hard work through the vault should revert while both flags are on");
+          assert.include(message, flagsOn);
+          assert.deepEqual(await userState(farmer1), before, "a keeper hard work that reverts should change nothing");
+
+          // while governance's own hard work runs; the deposit still waits in the vault, which only its own hard work invests
+          await governanceHardWork();
+          Utils.assertBNEq(await vault.underlyingBalanceInVault(), before.vaultLP);
+        } finally {
+          await vault.setCompoundOnWithdraw(false, { from: governance });
+        }
+      } finally {
+        await vault.setInvestOnDeposit(false, { from: governance });
+      }
+
+      // with both flags off, the same withdrawal goes through, paid from the vault: nothing reaches the gauge
+      let expected = new BigNumber(await vault.underlyingBalanceWithInvestment()).times(shares).idiv(await vault.totalSupply());
+      let farmerBefore = new BigNumber(await underlying.balanceOf(farmer1));
+      let tx = await vault.withdraw(shares.toFixed(), { from: farmer1 });
+      Utils.assertBNEq(new BigNumber(await underlying.balanceOf(farmer1)).minus(farmerBefore), expected);
+      assert.equal((await gaugeEvents("Withdraw", tx.receipt.blockNumber)).length, 0, "the withdrawal should be paid from the vault");
+      assert.equal((await gaugeEvents("Deposit", tx.receipt.blockNumber)).length, 0, "user withdrawal should not reach the gauge");
+      // and the keeper's hard work runs again: it invests the LP waiting in the vault and stakes it
+      let block = await doHardWork();
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "keeper hard work should stake");
+      Utils.assertBNEq(await unstakedLP(), 0);
+    });
+
+    it("Hands all the LP to the vault through withdrawAll with both flags on: that path runs no hard work", async function() {
+      // withdrawAll, which rebalance, setStrategy (migration) and the last share's withdrawal also use, runs no hard work,
+      // so the vault's flags must not block it: a new vault starts with investOnDeposit on, and its strategy must still
+      // be able to leave. The test runs on a snapshot that it reverts, so the tests after it see the chain as before
+      let snapshot = await hre.network.provider.send("evm_snapshot", []);
+      try {
+        await vault.setInvestOnDeposit(true, { from: governance });
+        await vault.setCompoundOnWithdraw(true, { from: governance });
+        let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+        Utils.assertBNGt(staked, 0);
+        let total = new BigNumber(await vault.underlyingBalanceWithInvestment());
+        let tx = await vault.withdrawAll({ from: governance, gasPrice: keeperGasPrice });
+        let withdrawn = await gaugeEvents("Withdraw", tx.receipt.blockNumber);
+        assert.equal(withdrawn.length, 1, "withdrawAll should take the stake out while both flags are on");
+        Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+        Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+        Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+        Utils.assertBNGte(await vault.underlyingBalanceInVault(), total);
+      } finally {
+        await hre.network.provider.send("evm_revert", [snapshot]);
       }
     });
   });
@@ -1257,7 +1502,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       await gaugeFactory.setMinStakeBlocks(gaugeAddress, 7, { from: penaltyAdmin });
     });
 
-    it("Claims and stakes on every hard work while Aero charges no penalty, even with a window", async function() {
+    it("Claims and stakes on every hard work while Aero charges no penalty, even with a window, and stakes even when the claim fails", async function() {
       let block = await claimThenStake(await farmer2LP(10));
       let config = await gaugeFactoryGovernance.methods.penaltyConfig().call();
       assert.equal(config.penaltyRate.toString(), "1000000", "Aero's default should forfeit everything inside the window");
@@ -1296,6 +1541,33 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         let claimed = await gaugeEvents("EmissionsClaimed", tx.receipt.blockNumber);
         assert.equal(claimed.length, 1);
         Utils.assertBNEq(claimed[0].args._rewardAmount.toString(), (await accruedSince(before)).plus(before.rewards));
+
+        // with nothing to forfeit a stake cannot cost rewards either, so it does not wait for a claim: the hard work stakes
+        // even when its claim fails (minting paused), still inside the 7 blocks of the last stake
+        let lastStake = Number((await gauge.depositBlock(strategy.address)).toString());
+        await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+        let idle = await unstakedLP();
+        await leafVoter.setChainStatus(2, { from: penaltyAdmin }); // Paused: minting reverts
+        try {
+          block = await doHardWork();
+        } finally {
+          await leafVoter.setChainStatus(1, { from: penaltyAdmin }); // Active again
+        }
+        assert.isBelow(block, lastStake + 7, "should run inside the window of the last stake");
+        let failures = await strategyEvents("ClaimFailed", block);
+        assert.equal(failures.length, 1, "the claim should fail without reverting");
+        assert.notEqual(failures[0].args.reason, insufficientGasError, "minting paused, not Aero's gas check");
+        assert.equal((await strategyEvents("ClaimSkipped", block)).length, 0, "should not skip the claim");
+        assert.equal((await strategyEvents("StakeSkipped", block)).length, 0, "nothing can be forfeited at a zero penalty: the stake should not wait for a claim");
+        assert.equal((await strategyEvents("StakeFailed", block)).length, 0);
+        let deposits = await gaugeEvents("Deposit", block);
+        assert.equal(deposits.length, 1, "should stake without the claim");
+        let minted = await mintedLP(block);
+        console.log("staked without a claim at a zero penalty: ", deposits[0].args._amount.toString(), " (idle LP ", idle.toFixed(),
+          ", compounded ", minted.toFixed(), "); claim failure: ", failures[0].args.reason);
+        Utils.assertBNEq(deposits[0].args._amount.toString(), idle.plus(minted));
+        Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+        assert.equal((await strategy.lastStakeBlock()).toString(), String(block));
       } finally {
         await gaugeFactoryGovernance.methods.setPenaltyConfig(config.minStakeBlocks, config.penaltyRate).send({ from: penaltyAdmin });
       }
@@ -1579,7 +1851,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         assert.isBelow(next, block + 7, "should run inside the window");
         assert.equal((await strategyEvents("ClaimSkipped", next)).length, 1, "claim should be skipped");
         assert.equal((await gaugeEvents("Withdraw", next)).length, 0, "should not leave the gauge without a claim");
-        assert.equal((await strategyEvents("UnstakedFromInactiveGauge", next)).length, 0);
+        assert.equal((await strategyEvents("UnstakedFromGauge", next)).length, 0);
         assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
         assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should not stake in a switched-off gauge");
         assert.equal((await strategyEvents("StakeSkipped", next)).length, 1);
@@ -1601,7 +1873,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         let withdrawn = await gaugeEvents("Withdraw", next);
         assert.equal(withdrawn.length, 1, "should take the stake out right after the claim");
         Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
-        let unstaked = await strategyEvents("UnstakedFromInactiveGauge", next);
+        let unstaked = await strategyEvents("UnstakedFromGauge", next);
         assert.equal(unstaked.length, 1);
         Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
         assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
@@ -1625,7 +1897,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         assert.isAtLeast(next, stakeBlock, "should be past the old stake's stakeSpacing");
         assert.equal((await gaugeEvents("EmissionsClaimed", next)).length, 0, "nothing staked: nothing to claim");
         assert.equal((await gaugeEvents("Withdraw", next)).length, 0);
-        assert.equal((await strategyEvents("UnstakedFromInactiveGauge", next)).length, 0);
+        assert.equal((await strategyEvents("UnstakedFromGauge", next)).length, 0);
         assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should not stake in a switched-off gauge");
         skipped = await strategyEvents("StakeSkipped", next);
         assert.equal(skipped.length, 1);
@@ -1657,42 +1929,32 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
     });
 
     it("Runs a hard work that governance calls directly while investOnDeposit is on, under the same window rules", async function() {
-      await advanceToBlock(await nextStakeBlock());
+      // while the flag is on a user deposit reverts (it would run the hard work), so new LP reaches the strategy before: a
+      // deposit, and a keeper hard work inside the window of the last stake, which invests it and skips the claim and the
+      // stake
+      let block = await claimThenStake(await farmer2LP(10));
+      let stakeBlock = await nextStakeBlock();
+      assert.equal(stakeBlock, block + 70);
+      let amount = await farmer2LP(10);
+      await depositVault(farmer2, underlying, vault, amount);
+      let next = await doHardWork();
+      assert.isBelow(next, block + 7, "should run inside the window");
+      assert.equal((await strategyEvents("ClaimSkipped", next)).length, 1, "claim should be skipped");
+      assert.equal((await strategyEvents("StakeSkipped", next)).length, 1, "stake should be skipped");
+      Utils.assertBNGte(await underlying.balanceOf(strategy.address), amount);
+
       await vault.setInvestOnDeposit(true, { from: governance });
       try {
-        // a user deposit moves the LP on to the strategy, but its hard work is skipped, and so is the keeper's
-        let amount = await farmer2LP(10);
-        await underlying.approve(vault.address, amount, { from: farmer2 });
-        let tx = await vault.deposit(amount, farmer2, { from: farmer2 });
-        assert.equal((await strategyEvents("HardWorkSkipped", tx.receipt.blockNumber)).length, 1, "user deposit should not run the hard work");
-        assert.equal((await gaugeEvents("Deposit", tx.receipt.blockNumber)).length, 0, "user deposit should not reach the gauge");
-        Utils.assertBNGte(await underlying.balanceOf(strategy.address), amount);
-        let block = await doHardWork();
-        assert.equal((await strategyEvents("HardWorkSkipped", block)).length, 1, "keeper hard work should be skipped");
-
-        // governance calling the strategy itself is not skipped: outside the window and past stakeSpacing, it claims and stakes
-        tx = await strategy.doHardWork({ from: governance, gasPrice: keeperGasPrice });
-        block = tx.receipt.blockNumber;
-        assert.equal((await strategyEvents("HardWorkSkipped", block)).length, 0, "a direct hard work should not be skipped");
-        assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 1, "should claim");
-        assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake right after the claim");
-        Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
-        let window = await strategy.penaltyWindow();
-        assert.equal(window.windowEndBlock.toString(), String(block + 7));
-        assert.equal(window.inWindow, true, "should be inside the window");
-
-        // inside the window it skips the claim and the stake, like a keeper hard work
-        amount = await farmer2LP(10);
-        await underlying.approve(vault.address, amount, { from: farmer2 });
-        await vault.deposit(amount, farmer2, { from: farmer2 });
-        tx = await strategy.doHardWork({ from: governance, gasPrice: keeperGasPrice });
-        let next = tx.receipt.blockNumber;
+        // governance calling the strategy itself is not refused: still inside the window, it skips the claim and the stake,
+        // like a keeper hard work
+        let tx = await strategy.doHardWork({ from: governance, gasPrice: keeperGasPrice });
+        next = tx.receipt.blockNumber;
         assert.isBelow(next, block + 7, "should run inside the window");
-        assert.equal((await strategyEvents("HardWorkSkipped", next)).length, 0);
         assert.equal((await strategyEvents("ClaimSkipped", next)).length, 1, "claim should be skipped");
         assert.equal((await strategyEvents("StakeSkipped", next)).length, 1, "stake should be skipped");
         assert.equal((await gaugeEvents("EmissionsClaimed", next)).length, 0);
         assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
+        assert.equal((await gaugeEvents("Deposit", next)).length, 0);
 
         // after the window it claims, and waits for stakeSpacing to stake
         await advanceToBlock(block + 6);
@@ -1702,6 +1964,31 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         assert.equal((await gaugeEvents("EmissionsClaimed", next)).length, 1, "should claim after the window");
         assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should still wait for stakeSpacing");
         assert.equal((await strategyEvents("StakeSkipped", next)).length, 1);
+
+        // meanwhile a user deposit reverts, and so does the keeper's hard work through the vault
+        let deposit = await farmer2LP(10);
+        await underlying.approve(vault.address, deposit, { from: farmer2 });
+        let message = await revertMessage(vault.deposit(deposit, farmer2, { from: farmer2 }), "a user deposit should revert while investOnDeposit is on");
+        assert.include(message, "investOnDeposit or compoundOnWithdraw is on");
+        message = await revertMessage(controller.doHardWork(vault.address, { from: governance, gasPrice: keeperGasPrice }),
+          "the keeper's hard work should revert while investOnDeposit is on");
+        assert.include(message, "investOnDeposit or compoundOnWithdraw is on");
+
+        // outside the window and past stakeSpacing, governance's own hard work claims and stakes
+        let idle = new BigNumber(await underlying.balanceOf(strategy.address));
+        Utils.assertBNGte(idle, amount);
+        await advanceToBlock(stakeBlock - 1);
+        tx = await strategy.doHardWork({ from: governance, gasPrice: keeperGasPrice });
+        next = tx.receipt.blockNumber;
+        assert.equal(next, stakeBlock);
+        assert.equal((await gaugeEvents("EmissionsClaimed", next)).length, 1, "should claim");
+        let deposits = await gaugeEvents("Deposit", next);
+        assert.equal(deposits.length, 1, "should stake right after the claim");
+        Utils.assertBNGte(deposits[0].args._amount.toString(), idle);
+        Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+        let window = await strategy.penaltyWindow();
+        assert.equal(window.windowEndBlock.toString(), String(next + 7));
+        assert.equal(window.inWindow, true, "should be inside the window");
       } finally {
         await vault.setInvestOnDeposit(false, { from: governance });
       }
@@ -1743,7 +2030,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         let withdrawn = await gaugeEvents("Withdraw", block);
         assert.equal(withdrawn.length, 1, "should take the stake out through the normal withdraw");
         Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
-        let unstaked = await strategyEvents("UnstakedFromInactiveGauge", block);
+        let unstaked = await strategyEvents("UnstakedFromGauge", block);
         assert.equal(unstaked.length, 1);
         Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
         assert.equal((await gaugeEvents("EarlyWithdrawPenalty", block)).length, 0);
@@ -1768,7 +2055,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         block = await doHardWork();
         assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 0);
         assert.equal((await gaugeEvents("Withdraw", block)).length, 0);
-        assert.equal((await strategyEvents("UnstakedFromInactiveGauge", block)).length, 0);
+        assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 0);
         assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake in a switched-off gauge");
         assert.equal((await strategyEvents("StakeSkipped", block)).length, 1);
       } finally {
@@ -1859,7 +2146,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
           let withdrawn = await gaugeEvents("Withdraw", block);
           assert.equal(withdrawn.length, 1, "should take the stake out right after the claim");
           Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
-          let unstaked = await strategyEvents("UnstakedFromInactiveGauge", block);
+          let unstaked = await strategyEvents("UnstakedFromGauge", block);
           assert.equal(unstaked.length, 1);
           Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
           assert.equal((await gaugeEvents("EarlyWithdrawPenalty", block)).length, 0);
@@ -1895,7 +2182,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
           let block = await doHardWork();
           assert.equal((await strategyEvents("ClaimFailed", block)).length, 1, "claim should fail without reverting");
           assert.equal((await gaugeEvents("Withdraw", block)).length, 0, "should not leave the gauge without a claim");
-          assert.equal((await strategyEvents("UnstakedFromInactiveGauge", block)).length, 0);
+          assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 0);
           Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
           assert.notEqual((await strategy.lastStakeBlock()).toString(), "0");
         } finally {
@@ -1904,7 +2191,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
 
         let block = await doHardWork();
         assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 1, "should claim");
-        let unstaked = await strategyEvents("UnstakedFromInactiveGauge", block);
+        let unstaked = await strategyEvents("UnstakedFromGauge", block);
         assert.equal(unstaked.length, 1, "should leave the gauge right after the claim");
         Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
         assert.equal((await gaugeEvents("Withdraw", block)).length, 1);
@@ -1949,7 +2236,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         let tx = await controller.doHardWork(vault.address, { from: governance, gasPrice: keeperGasPrice, gas: least + 200000 });
         let block = tx.receipt.blockNumber;
         assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 1, "should claim");
-        assert.equal((await strategyEvents("UnstakedFromInactiveGauge", block)).length, 1, "should leave the gauge");
+        assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 1, "should leave the gauge");
         Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
       } finally {
         await setEmissionCap(cap);
@@ -1977,7 +2264,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
           assert.equal(failures[0].args.reason, "0xdeadbeef", "the gauge's own revert data");
           assert.equal((await gaugeEvents("Withdraw", block)).length, 0);
           assert.equal((await gaugeEvents("EmergencyWithdraw", block)).length, 0);
-          assert.equal((await strategyEvents("UnstakedFromInactiveGauge", block)).length, 0);
+          assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 0);
           Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
           assert.equal((await strategy.lastStakeBlock()).toString(), lastStake);
         });
@@ -2002,7 +2289,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
             let exits = await gaugeEvents("EmergencyWithdraw", block);
             assert.equal(exits.length, 1, "should leave through emergencyWithdraw");
             Utils.assertBNEq(exits[0].args._amount.toString(), staked);
-            let unstaked = await strategyEvents("UnstakedFromInactiveGauge", block);
+            let unstaked = await strategyEvents("UnstakedFromGauge", block);
             assert.equal(unstaked.length, 1);
             Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
             assert.equal((await strategyEvents("GaugeExitFailed", block)).length, 0);
@@ -2021,6 +2308,585 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       let block = await doHardWork();
       assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake again");
       Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+    });
+  });
+
+  describe("Kept unstaked by governance (no window)", function() {
+    // governance's switch for a gauge that Aero stops paying without switching it off (a full shutdown, which the emission
+    // cap check can miss): the strategy then treats the gauge as switched off, while Aero still pays it here
+    let cap;
+    let previousWindow;
+
+    before(async function() {
+      previousWindow = (await gaugeFactory.effectivePenaltyConfig(gaugeAddress)).minStakeBlocks.toString();
+      await gaugeFactory.setMinStakeBlocks(gaugeAddress, 0, { from: penaltyAdmin });
+      await assertNoWindow();
+      cap = (await gaugeFactory.emissionCap(gaugeAddress)).toString();
+      Utils.assertBNGt(cap, 0);
+      assert.equal(await strategy.keepUnstaked(), false);
+      await doHardWork(); // everything staked
+    });
+
+    after(async function() {
+      await gaugeFactory.setMinStakeBlocks(gaugeAddress, previousWindow, { from: penaltyAdmin });
+    });
+
+    // governance switches keepUnstaked to `value`, and each call is reported
+    async function setKeepUnstaked(value) {
+      let tx = await strategy.setKeepUnstaked(value, { from: governance });
+      let changed = await strategyEvents("KeepUnstakedChanged", tx.receipt.blockNumber);
+      assert.equal(changed.length, 1, "each call should be reported");
+      assert.equal(changed[0].args.keepUnstaked, value);
+      assert.equal(await strategy.keepUnstaked(), value);
+    }
+
+    // what the gauge's LeafVoter took back from the gauge in `block`: forfeited penalties, emissions nobody could earn
+    async function forfeited(block) {
+      return await leafVoterEvents.getPastEvents("EmissionsForfeited", { filter: { _gauge: gaugeAddress }, fromBlock: block, toBlock: block });
+    }
+
+    // farmer2 swaps through the pool, both ways, whose fees go to the LP held out of the gauge; returns the pool fees the
+    // strategy is then owed, which must have grown
+    async function swapThroughPool() {
+      let feesBefore = await pendingFees();
+      await burnLP(100);
+      await poolSwap(farmer2, usdc, (await usdcToken.balanceOf(farmer2)).toString());
+      await poolSwap(farmer2, alusdb, (await alusdbToken.balanceOf(farmer2)).toString());
+      let pending = await pendingFees();
+      Utils.assertBNGt(await dollars(pending.amount0, pending.amount1), await dollars(feesBefore.amount0, feesBefore.amount1));
+      return pending;
+    }
+
+    // a hard work with nothing staked, kept unstaked: it claims the pool fees `pending` and compounds them into LP, which
+    // stays idle with the rest
+    async function compoundFeesUnstaked(pending) {
+      let idle = await unstakedLP();
+      let sharePrice = new BigNumber(await vault.getPricePerFullShare());
+      let block = await doHardWork();
+      let claims = await feeClaims(block);
+      assert.equal(claims.length, 1, "should claim the pool fees");
+      Utils.assertBNEq(claims[0].returnValues.amount0, pending.amount0);
+      Utils.assertBNEq(claims[0].returnValues.amount1, pending.amount1);
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should mint LP from the fees");
+      let compounded = await mintedLP(block);
+      Utils.assertBNGt(compounded, 0);
+      Utils.assertBNGt(await vault.getPricePerFullShare(), sharePrice);
+      // nothing staked, so nothing to take out, and nothing staked either
+      assert.equal((await gaugeEvents("Withdraw", block)).length, 0);
+      assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 0);
+      assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should keep the LP unstaked");
+      Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+      Utils.assertBNEq(await underlying.balanceOf(strategy.address), idle.plus(compounded));
+      let skipped = await strategyEvents("StakeSkipped", block);
+      assert.equal(skipped.length, 1);
+      Utils.assertBNEq(skipped[0].args.idleAmount.toString(), idle.plus(compounded));
+      await assertIdleLPCounted();
+      return block;
+    }
+
+    it("Keeps the value governance sets when it sets the same value again, and reports every call", async function() {
+      // a repeated call (a multisig transaction sent again, a script that switches it on at every step) must leave the
+      // switch as governance set it: a setter that toggled would turn the switch off with a repeated switch-on, one that
+      // refused a call changing nothing would make a batch with it revert, and one that reported only changes would hide
+      // the call. The calls run on a snapshot that the test reverts, so the tests after it see the chain as before
+      let snapshot = await hre.network.provider.send("evm_snapshot", []);
+      try {
+        await setKeepUnstaked(true);
+        await setKeepUnstaked(true);
+        await setKeepUnstaked(false);
+        await setKeepUnstaked(false);
+      } finally {
+        await hre.network.provider.send("evm_revert", [snapshot]);
+      }
+      assert.equal(await strategy.keepUnstaked(), false);
+    });
+
+    it("Takes the whole stake out of a gauge Aero still pays right after its claim, once governance keeps the LP unstaked, with nothing forfeited", async function() {
+      await mineBlocks(1800); // an hour of rewards
+      try {
+        await setKeepUnstaked(true);
+        // Aero has not switched the gauge off
+        Utils.assertBNEq(await gaugeFactory.emissionCap(gaugeAddress), cap);
+        let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+        Utils.assertBNGt(staked, 0);
+        let unstakedBefore = await unstakedLP();
+        let value = new BigNumber(await vault.underlyingBalanceWithInvestment());
+        let before = await gaugeCheckpoint();
+        let block = await doHardWork();
+
+        // as from a gauge Aero switched off: the claim pays all the stake earned, so the exit right after it, in the same
+        // transaction and through the gauge's normal withdraw, finds nothing to forfeit
+        let claimed = await gaugeEvents("EmissionsClaimed", block);
+        assert.equal(claimed.length, 1, "should claim");
+        Utils.assertBNGt(claimed[0].args._rewardAmount.toString(), 0);
+        Utils.assertBNEq(claimed[0].args._rewardAmount.toString(), (await accruedSince(before)).plus(before.rewards));
+        let withdrawn = await gaugeEvents("Withdraw", block);
+        assert.equal(withdrawn.length, 1, "should take the stake out through the normal withdraw");
+        Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+        let unstaked = await strategyEvents("UnstakedFromGauge", block);
+        assert.equal(unstaked.length, 1);
+        Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
+        assert.equal((await gaugeEvents("EarlyWithdrawPenalty", block)).length, 0);
+        assert.equal((await gaugeEvents("EmergencyWithdraw", block)).length, 0);
+        assert.equal((await forfeited(block)).length, 0, "nothing should be forfeited");
+        Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+        assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+        assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake while kept unstaked");
+
+        // all the LP waits in the strategy and keeps counting: the vault's value only grew, by the LP compounded from the
+        // claim, so the exit itself changed nothing
+        let idle = new BigNumber(await underlying.balanceOf(strategy.address));
+        let compounded = await mintedLP(block);
+        Utils.assertBNGt(compounded, 0);
+        Utils.assertBNEq(idle, unstakedBefore.plus(staked).plus(compounded));
+        let skipped = await strategyEvents("StakeSkipped", block);
+        assert.equal(skipped.length, 1);
+        Utils.assertBNEq(skipped[0].args.idleAmount.toString(), idle);
+        Utils.assertBNEq(await vault.underlyingBalanceWithInvestment(), value.plus(compounded));
+        await assertIdleLPCounted();
+        Utils.assertBNEq(await gaugeFactory.emissionCap(gaugeAddress), cap);
+      } finally {
+        await strategy.setKeepUnstaked(false, { from: governance });
+      }
+    });
+
+    it("Keeps new LP idle while kept unstaked, and compounds the pool fees its idle LP earns into LP", async function() {
+      // nothing staked since the exit above: all the LP is out of the gauge, and earns its share of every swap's fees
+      Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+      try {
+        await setKeepUnstaked(true);
+        for (let i = 0; i < 2; i++) {
+          await depositVault(farmer2, underlying, vault, await farmer2LP(20)); // new LP
+          let block = await compoundFeesUnstaked(await swapThroughPool());
+          assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 0, "nothing staked: nothing to claim");
+        }
+      } finally {
+        await strategy.setKeepUnstaked(false, { from: governance });
+      }
+    });
+
+    it("Stakes all the idle LP at once when governance switches keepUnstaked off, even with the default minStakeInterval", async function() {
+      // the exit with the switch on emptied the gauge and reset lastStakeBlock: no interval to wait for once it is off
+      Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+      assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+      await strategy.setMinStakeInterval(432000, { from: governance });
+      try {
+        try {
+          await setKeepUnstaked(true);
+          // while it is on, new LP stays idle
+          await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+          let block = await doHardWork();
+          assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should keep the LP unstaked");
+          assert.equal((await strategyEvents("StakeSkipped", block)).length, 1);
+          let idle = new BigNumber(await underlying.balanceOf(strategy.address));
+          Utils.assertBNGt(idle, 0);
+
+          // switched off, the next hard work stakes all of it at once
+          await setKeepUnstaked(false);
+          block = await doHardWork();
+          let deposits = await gaugeEvents("Deposit", block);
+          assert.equal(deposits.length, 1, "should stake at once");
+          Utils.assertBNGte(deposits[0].args._amount.toString(), idle);
+          assert.equal((await strategyEvents("StakeSkipped", block)).length, 0);
+          Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+          assert.equal((await strategy.lastStakeBlock()).toString(), String(block));
+        } finally {
+          if (await strategy.keepUnstaked()) {
+            await strategy.setKeepUnstaked(false, { from: governance });
+          }
+        }
+      } finally {
+        await strategy.setMinStakeInterval(0, { from: governance });
+      }
+    });
+
+    it("Under a window, takes the stake out only with its first claim after the window, without waiting for stakeSpacing", async function() {
+      await gaugeFactory.setMinStakeBlocks(gaugeAddress, 7, { from: penaltyAdmin });
+      try {
+        // a stake inside its window when governance switches keepUnstaked on, and new LP
+        let block = await claimThenStake(await farmer2LP(10));
+        let stakeBlock = await nextStakeBlock();
+        assert.equal(stakeBlock, block + 70);
+        await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+        try {
+          await setKeepUnstaked(true);
+          let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+
+          // inside the window it can claim nothing, and leaving would forfeit all the stake earned since the
+          // claim-then-stake: the stake stays, and the new LP waits unstaked
+          let next = await doHardWork();
+          assert.isBelow(next, block + 7, "should run inside the window");
+          assert.equal((await strategyEvents("ClaimSkipped", next)).length, 1, "claim should be skipped");
+          assert.equal((await gaugeEvents("Withdraw", next)).length, 0, "should not leave the gauge without a claim");
+          assert.equal((await strategyEvents("UnstakedFromGauge", next)).length, 0);
+          assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
+          assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should not stake while kept unstaked");
+          assert.equal((await strategyEvents("StakeSkipped", next)).length, 1);
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
+
+          // the first hard work after the window claims, then takes the whole stake out in the same transaction, with
+          // nothing left to forfeit, 63 blocks before stakeSpacing would allow a stake
+          await advanceToBlock(block + 6);
+          let before = await gaugeCheckpoint();
+          next = await doHardWork();
+          assert.equal(next, block + 7, "should run at the first block after the window");
+          assert.isBelow(next, stakeBlock, "should leave long before stakeSpacing would allow a stake");
+          assert.equal((await strategyEvents("ClaimSkipped", next)).length, 0);
+          assert.equal((await strategyEvents("ClaimFailed", next)).length, 0);
+          let claimed = await gaugeEvents("EmissionsClaimed", next);
+          assert.equal(claimed.length, 1, "should claim");
+          Utils.assertBNEq(claimed[0].args._rewardAmount.toString(), (await accruedSince(before)).plus(before.rewards));
+          let withdrawn = await gaugeEvents("Withdraw", next);
+          assert.equal(withdrawn.length, 1, "should take the stake out right after the claim");
+          Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+          let unstaked = await strategyEvents("UnstakedFromGauge", next);
+          assert.equal(unstaked.length, 1);
+          Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
+          assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
+          assert.equal((await gaugeEvents("EmergencyWithdraw", next)).length, 0);
+          assert.equal((await forfeited(next)).length, 0, "nothing should be forfeited");
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+          assert.equal((await gauge.depositBlock(strategy.address)).toString(), "0", "no window left to wait for");
+          assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+          assert.equal(await nextStakeBlock(), 0);
+          assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should not stake while kept unstaked");
+          let skipped = await strategyEvents("StakeSkipped", next);
+          assert.equal(skipped.length, 1);
+          Utils.assertBNEq(skipped[0].args.idleAmount.toString(), await underlying.balanceOf(strategy.address));
+          await assertIdleLPCounted();
+        } finally {
+          await strategy.setKeepUnstaked(false, { from: governance });
+        }
+      } finally {
+        await gaugeFactory.setMinStakeBlocks(gaugeAddress, 0, { from: penaltyAdmin });
+      }
+      await assertNoWindow();
+
+      // switched off, with nothing staked: the next hard work stakes all the LP at once
+      let block = await doHardWork();
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake again");
+      Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+    });
+
+    it("Under a window, stakes right after its claim, keeps the stake while the claim is skipped and takes it out with the first claim after the window, also while the liquidation fails as a whole", async function() {
+      // a liquidation that fails as a whole (here the liquidator's route is broken, as in "Aero failures") must not change
+      // what the claim decides: a stake right after a claim still goes through under the window, a hard work inside the
+      // window, whose claim is skipped, keeps the stake (leaving would forfeit all the stake earned since its last claim),
+      // and the first hard work after the window, whose claim goes through, takes it out
+      let universalLiquidator = await controller.universalLiquidator();
+      let restaked;
+      try {
+        await gaugeFactory.setMinStakeBlocks(gaugeAddress, 7, { from: penaltyAdmin });
+        try {
+          await controller.setUniversalLiquidator(farmer2, { from: governance }); // no code: every swap reverts
+          try {
+            // past the window and the stakeSpacing of the last stake, with new LP: the claim goes through, its sale fails as
+            // a whole, and the stake right after the claim still goes through. The AERO claimed stays unsold, so the sales
+            // below fail too
+            await advanceToBlock(await nextStakeBlock());
+            await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+            let block = await doHardWork();
+            let claims = await gaugeEvents("EmissionsClaimed", block);
+            assert.equal(claims.length, 1, "should claim outside the window");
+            assert.equal((await strategyEvents("LiquidationFailed", block)).length, 1, "the sale should fail as a whole, without reverting");
+            assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "the fee should be undone with the liquidation");
+            assert.equal((await gaugeEvents("Deposit", block)).length, 1, "the stake right after a claim should go through while the liquidation fails");
+            Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+            let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+            Utils.assertBNGte(aeroHeld, claims[0].args._rewardAmount.toString());
+            let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+
+            // new LP, and governance keeps the LP unstaked while the stake is inside its window
+            await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+            await setKeepUnstaked(true);
+
+            // inside the window the claim is skipped and the sale of the AERO held fails as a whole again: the stake stays,
+            // and the new LP waits unstaked
+            let next = await doHardWork();
+            assert.isBelow(next, block + 7, "should run inside the window");
+            assert.equal((await strategyEvents("ClaimSkipped", next)).length, 1, "claim should be skipped");
+            assert.equal((await strategyEvents("LiquidationFailed", next)).length, 1, "the sale of the AERO held should fail as a whole");
+            assert.equal((await gaugeEvents("Withdraw", next)).length, 0, "a liquidation that fails as a whole should not take the stake out without a claim");
+            assert.equal((await strategyEvents("UnstakedFromGauge", next)).length, 0);
+            assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
+            assert.equal((await forfeited(next)).length, 0, "nothing should be forfeited");
+            assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should not stake while kept unstaked");
+            assert.equal((await strategyEvents("StakeSkipped", next)).length, 1);
+            Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
+
+            // the first hard work after the window claims, its sale fails as a whole once more, and it takes the whole stake
+            // out right after the claim, with nothing left to forfeit
+            await advanceToBlock(block + 6);
+            let before = await gaugeCheckpoint();
+            next = await doHardWork();
+            assert.equal(next, block + 7, "should run at the first block after the window");
+            claims = await gaugeEvents("EmissionsClaimed", next);
+            assert.equal(claims.length, 1, "should claim");
+            Utils.assertBNEq(claims[0].args._rewardAmount.toString(), (await accruedSince(before)).plus(before.rewards));
+            assert.equal((await strategyEvents("LiquidationFailed", next)).length, 1, "the sale should fail as a whole");
+            let withdrawn = await gaugeEvents("Withdraw", next);
+            assert.equal(withdrawn.length, 1, "a liquidation that fails as a whole should not keep the stake in after a claim");
+            Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+            let unstaked = await strategyEvents("UnstakedFromGauge", next);
+            assert.equal(unstaked.length, 1);
+            Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
+            assert.equal((await gaugeEvents("EarlyWithdrawPenalty", next)).length, 0);
+            assert.equal((await gaugeEvents("EmergencyWithdraw", next)).length, 0);
+            assert.equal((await forfeited(next)).length, 0, "nothing should be forfeited");
+            Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+            assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+            assert.equal((await gaugeEvents("Deposit", next)).length, 0, "should not stake while kept unstaked");
+            let skipped = await strategyEvents("StakeSkipped", next);
+            assert.equal(skipped.length, 1);
+            Utils.assertBNEq(skipped[0].args.idleAmount.toString(), await underlying.balanceOf(strategy.address));
+            // nothing sold: the AERO waits for a working route
+            Utils.assertBNGte(await aeroToken.balanceOf(strategy.address), aeroHeld.plus(claims[0].args._rewardAmount.toString()));
+          } finally {
+            if (await strategy.keepUnstaked()) {
+              await strategy.setKeepUnstaked(false, { from: governance });
+            }
+            await controller.setUniversalLiquidator(universalLiquidator, { from: governance });
+          }
+        } finally {
+          await gaugeFactory.setMinStakeBlocks(gaugeAddress, 0, { from: penaltyAdmin });
+        }
+      } finally {
+        // no window, the route back and keepUnstaked off: the next hard work sells the AERO kept and stakes all the LP at
+        // once, also when a check above fails, so that the tests below find it staked
+        restaked = await doHardWork();
+      }
+      await assertNoWindow();
+      assert.equal((await strategyEvents("LiquidationFailed", restaked)).length, 0);
+      assert.equal((await strategyEvents(profitLogInReward, restaked)).length, 1, "should sell the AERO kept");
+      // neither pool token is AERO: a working route sells all of it
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await gaugeEvents("Deposit", restaked)).length, 1, "should stake again");
+      Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+    });
+
+    it("Keeps the stake while claims fail (minting paused, as in a shutdown), leaves through emergencyExit with the AERO deferred, then stakes nothing and still compounds pool fees", async function() {
+      await mineBlocks(600); // AERO to claim
+      let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+      Utils.assertBNGt(staked, 0);
+      try {
+        await setKeepUnstaked(true);
+        await leafVoter.setChainStatus(2, { from: penaltyAdmin }); // Paused: minting reverts
+        try {
+          // the switch takes the stake out only right after a claim that goes through: while claims fail the hard work
+          // keeps it, and the new LP waits unstaked
+          await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+          let lastStake = (await strategy.lastStakeBlock()).toString();
+          assert.notEqual(lastStake, "0");
+          let block = await doHardWork();
+          assert.equal((await strategyEvents("ClaimFailed", block)).length, 1, "claim should fail without reverting");
+          assert.equal((await gaugeEvents("Withdraw", block)).length, 0, "should not leave the gauge without a claim");
+          assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 0);
+          assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake while kept unstaked");
+          assert.equal((await strategyEvents("StakeSkipped", block)).length, 1);
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
+          assert.equal((await strategy.lastStakeBlock()).toString(), lastStake);
+
+          // governance's emergency exit takes the stake out through the gauge's normal withdraw, which defers the AERO the
+          // stake earned (minting is paused) instead of forfeiting it
+          let tx = await strategy.emergencyExit({ from: governance });
+          block = tx.receipt.blockNumber;
+          let withdrawn = await gaugeEvents("Withdraw", block);
+          assert.equal(withdrawn.length, 1, "should leave through the normal withdraw");
+          Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+          let deferredEvents = await gaugeEvents("EmissionsDeferred", block);
+          assert.equal(deferredEvents.length, 1, "the withdraw should defer the AERO");
+          Utils.assertBNGt(deferredEvents[0].args._rewardAmount.toString(), 0);
+          Utils.assertBNEq(await gauge.deferredEmissions(strategy.address), deferredEvents[0].args._rewardAmount.toString());
+          assert.equal((await gaugeEvents("EmergencyWithdraw", block)).length, 0);
+          assert.equal((await gaugeEvents("EarlyWithdrawPenalty", block)).length, 0);
+          assert.equal((await forfeited(block)).length, 0, "nothing should be forfeited");
+          assert.equal((await strategyEvents("GaugeExitFailed", block)).length, 0);
+          assert.equal(await strategy.pausedInvesting(), true);
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+          assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+
+          // investing resumed, the hard works stake nothing, and still compound the pool fees the idle LP earns, while the
+          // claim of the deferred AERO keeps failing
+          await strategy.continueInvesting({ from: governance });
+          for (let i = 0; i < 2; i++) {
+            block = await compoundFeesUnstaked(await swapThroughPool());
+            assert.equal((await strategyEvents("ClaimFailed", block)).length, 1, "the deferred AERO cannot be claimed yet");
+          }
+          Utils.assertBNEq(await gauge.deferredEmissions(strategy.address), deferredEvents[0].args._rewardAmount.toString());
+        } finally {
+          await leafVoter.setChainStatus(1, { from: penaltyAdmin }); // Active again
+        }
+
+        // once minting resumes, the next hard work collects the deferred AERO, and still stakes nothing
+        let deferred = new BigNumber(await gauge.deferredEmissions(strategy.address));
+        let block = await doHardWork();
+        let collected = await gaugeEvents("DeferredEmissionsClaimed", block);
+        assert.equal(collected.length, 1, "should collect the deferred AERO");
+        Utils.assertBNEq(collected[0].args._amount.toString(), deferred);
+        Utils.assertBNEq(await gauge.deferredEmissions(strategy.address), 0);
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "should sell it");
+        assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake while kept unstaked");
+        Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+      } finally {
+        if (await strategy.pausedInvesting()) {
+          await strategy.continueInvesting({ from: governance });
+        }
+        await strategy.setKeepUnstaked(false, { from: governance });
+      }
+
+      // switched off: the next hard work stakes all the LP at once
+      let block = await doHardWork();
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake again");
+      Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+    });
+
+    it("Takes the stake out right after its claim and stakes no new LP when Aero switches the gauge off too, and still stakes none once governance switches keepUnstaked off", async function() {
+      // keepUnstaked and Aero's switch-off (emission cap 0) each keep all the LP out of the gauge: both at once must too, the
+      // stake taken out right after the claim, as with either alone
+      await mineBlocks(600); // AERO to claim
+      let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+      Utils.assertBNGt(staked, 0);
+      let restaked;
+      try {
+        await setKeepUnstaked(true);
+        await setEmissionCap(0);
+        try {
+          Utils.assertBNEq(await gaugeFactory.emissionCap(gaugeAddress), 0);
+          let unstakedBefore = await unstakedLP();
+          let before = await gaugeCheckpoint();
+          let block = await doHardWork();
+          // the claim pays all the stake earned, so the exit right after it, through the gauge's normal withdraw, finds
+          // nothing to forfeit
+          let claimed = await gaugeEvents("EmissionsClaimed", block);
+          assert.equal(claimed.length, 1, "should claim");
+          Utils.assertBNEq(claimed[0].args._rewardAmount.toString(), (await accruedSince(before)).plus(before.rewards));
+          let withdrawn = await gaugeEvents("Withdraw", block);
+          assert.equal(withdrawn.length, 1, "should take the stake out through the normal withdraw");
+          Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+          let unstaked = await strategyEvents("UnstakedFromGauge", block);
+          assert.equal(unstaked.length, 1, "should take the whole stake out right after the claim");
+          Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
+          assert.equal((await gaugeEvents("EarlyWithdrawPenalty", block)).length, 0);
+          assert.equal((await gaugeEvents("EmergencyWithdraw", block)).length, 0);
+          assert.equal((await forfeited(block)).length, 0, "nothing should be forfeited");
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+          assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+          assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake");
+          // all the LP waits in the strategy, the LP compounded from the claim with it
+          let idle = new BigNumber(await underlying.balanceOf(strategy.address));
+          Utils.assertBNEq(idle, unstakedBefore.plus(staked).plus(await mintedLP(block)));
+          let skipped = await strategyEvents("StakeSkipped", block);
+          assert.equal(skipped.length, 1);
+          Utils.assertBNEq(skipped[0].args.idleAmount.toString(), idle);
+          await assertIdleLPCounted();
+
+          // new LP, which the next hard work hands to the strategy, stays idle with the rest
+          await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+          let lp = await unstakedLP();
+          block = await doHardWork();
+          assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake the new LP");
+          skipped = await strategyEvents("StakeSkipped", block);
+          assert.equal(skipped.length, 1);
+          Utils.assertBNEq(skipped[0].args.idleAmount.toString(), await underlying.balanceOf(strategy.address));
+          Utils.assertBNGte(skipped[0].args.idleAmount.toString(), lp);
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+
+          // governance switches keepUnstaked off: the gauge, still switched off by Aero, gets no LP either
+          await setKeepUnstaked(false);
+          block = await doHardWork();
+          assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake in a switched-off gauge");
+          skipped = await strategyEvents("StakeSkipped", block);
+          assert.equal(skipped.length, 1);
+          Utils.assertBNEq(skipped[0].args.idleAmount.toString(), await underlying.balanceOf(strategy.address));
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+        } finally {
+          await setEmissionCap(cap);
+        }
+      } finally {
+        if (await strategy.keepUnstaked()) {
+          await strategy.setKeepUnstaked(false, { from: governance });
+        }
+        // both off: the next hard work stakes all the LP at once, also when a check above fails, so that the tests below
+        // find it staked
+        restaked = await doHardWork();
+      }
+      assert.equal((await gaugeEvents("Deposit", restaked)).length, 1, "should stake again");
+      Utils.assertBNEq(await unstakedLP(), 0);
+    });
+
+    it("Leaves the gauge through emergencyWithdraw when its withdraw fails after the claim, and keeps the stake when Aero has not enabled it, with the claim, the fee and the compounding done", async function() {
+      // kept unstaked, the exit after the claim is best effort, as from a gauge Aero switched off (cap 0; here Aero still
+      // pays it): a gauge withdraw that fails right after the claim must not revert the hard work, which keeps its claim,
+      // its fee and its compounding, and falls back to Aero's emergencyWithdraw when Aero has enabled it
+      await mineBlocks(600); // AERO to claim
+      let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+      Utils.assertBNGt(staked, 0);
+      let lastStake = (await strategy.lastStakeBlock()).toString();
+      let restaked;
+      try {
+        await setKeepUnstaked(true);
+        Utils.assertBNEq(await gaugeFactory.emissionCap(gaugeAddress), cap); // Aero has not switched the gauge off
+        assert.equal(await gaugeFactory.emergencyWithdrawEnabled(), false, "Aero has not enabled emergencyWithdraw");
+
+        // the gauge's withdraw fails right after the claim. With emergencyWithdraw disabled the exit fails too: the hard work
+        // reports it, keeps the stake and goes on, with what it did before the exit done
+        await withGaugeFailingAfterClaim(async () => {
+          let block = await doHardWork();
+          assert.equal((await gaugeEvents("EmissionsClaimed", block)).length, 1, "the claim should go through");
+          assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "the AERO sale and its fee should stay done");
+          assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+          assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+          assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "the compounding should stay done");
+          Utils.assertBNGt(await mintedLP(block), 0);
+          let failures = await strategyEvents("GaugeExitFailed", block);
+          assert.equal(failures.length, 1, "the exit should fail without reverting");
+          assert.equal(failures[0].args.reason, "0xdeadbeef", "the gauge's own revert data");
+          assert.equal((await gaugeEvents("Withdraw", block)).length, 0);
+          assert.equal((await gaugeEvents("EmergencyWithdraw", block)).length, 0);
+          assert.equal((await strategyEvents("UnstakedFromGauge", block)).length, 0);
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
+          assert.equal((await strategy.lastStakeBlock()).toString(), lastStake);
+          // and it stakes nothing: the LP it compounded waits unstaked
+          assert.equal((await gaugeEvents("Deposit", block)).length, 0, "should not stake while kept unstaked");
+          let skipped = await strategyEvents("StakeSkipped", block);
+          assert.equal(skipped.length, 1);
+          Utils.assertBNEq(skipped[0].args.idleAmount.toString(), await underlying.balanceOf(strategy.address));
+        });
+
+        // enabled: the exit falls back to emergencyWithdraw. The stake first earns AERO to claim again
+        await mineBlocks(600);
+        await gaugeFactory.setEmergencyWithdrawEnabled(true, { from: emergencyWithdrawAdmin });
+        try {
+          await withGaugeFailingAfterClaim(async () => {
+            let before = await gaugeCheckpoint();
+            let block = await doHardWork();
+            // emergencyWithdraw does no emission accounting (V2Gauge.emergencyWithdraw): the claim right before it, in the
+            // same transaction, paying everything the stake earned is what shows that nothing is lost
+            let claimed = await gaugeEvents("EmissionsClaimed", block);
+            assert.equal(claimed.length, 1, "the claim should go through");
+            Utils.assertBNEq(claimed[0].args._rewardAmount.toString(), (await accruedSince(before)).plus(before.rewards));
+            let exits = await gaugeEvents("EmergencyWithdraw", block);
+            assert.equal(exits.length, 1, "should leave through emergencyWithdraw");
+            Utils.assertBNEq(exits[0].args._amount.toString(), staked);
+            let unstaked = await strategyEvents("UnstakedFromGauge", block);
+            assert.equal(unstaked.length, 1);
+            Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
+            assert.equal((await strategyEvents("GaugeExitFailed", block)).length, 0);
+            Utils.assertBNEq(await gauge.rewards(strategy.address), 0);
+            Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+            assert.equal((await strategy.lastStakeBlock()).toString(), "0");
+          });
+        } finally {
+          await gaugeFactory.setEmergencyWithdrawEnabled(false, { from: emergencyWithdrawAdmin });
+        }
+      } finally {
+        await strategy.setKeepUnstaked(false, { from: governance });
+        // with the gauge working and keepUnstaked off, the next hard work stakes everything at once, also when a check above
+        // fails, so that the tests below find it staked
+        restaked = await doHardWork();
+      }
+      assert.equal((await gaugeEvents("Deposit", restaked)).length, 1, "should stake again");
+      Utils.assertBNEq(await unstakedLP(), 0);
     });
   });
 
@@ -2188,10 +3054,21 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       await gaugeFactory.setMinStakeBlocks(gaugeAddress, 7, { from: penaltyAdmin });
     });
 
-    it("Lets only the strategy itself run liquidateRewards", async function() {
+    it("Lets only the strategy itself run liquidateRewards and compoundPoolTokens", async function() {
       // doHardWork and withdrawAllToVault call it on the strategy, so that its failures can be caught
       let message = await revertMessage(strategy.liquidateRewards({ from: governance }), "governance should not run liquidateRewards");
       assert.include(message, "Only self");
+      message = await revertMessage(strategy.liquidateRewards({ from: farmer2 }), "an outsider should not run liquidateRewards");
+      assert.include(message, "Only self");
+
+      // liquidateRewards calls compoundPoolTokens on the strategy too, so that a failed compounding leaves the reward sale
+      // and its fee done; nobody else may run it, with any reward token or reserve
+      for (let [name, from] of [["governance", governance], ["an outsider", farmer2]]) {
+        for (let [rewardToken, reserved] of [[aero, "0"], [usdc, "1"]]) {
+          message = await revertMessage(strategy.compoundPoolTokens(rewardToken, reserved, { from: from }), name + " should not run compoundPoolTokens");
+          assert.include(message, "Only self", name + " should be rejected");
+        }
+      }
     });
 
     it("Rejects an outsider on the hard work, every exit and every setting, so nobody can force a withdrawal inside the window", async function() {
@@ -2225,6 +3102,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         ["continueInvesting", () => strategy.continueInvesting({ from: farmer2 })],
         ["setSell", () => strategy.setSell(false, { from: farmer2 })],
         ["setMinStakeInterval", () => strategy.setMinStakeInterval(12960000, { from: farmer2 })],
+        ["setKeepUnstaked", () => strategy.setKeepUnstaked(true, { from: farmer2 })],
         ["addRewardToken", () => strategy.addRewardToken(weth, { from: farmer2 })],
         ["removeRewardToken", () => strategy.removeRewardToken(weth, { from: farmer2 })],
         ["finalizeUpgrade", () => strategy.finalizeUpgrade({ from: farmer2 })],
@@ -2242,6 +3120,9 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         // minStakeInterval of 12,960,000 blocks would put every later stake ~13M blocks away
         if ((await strategy.minStakeInterval()).toString() != "0") {
           await strategy.setMinStakeInterval(0, { from: governance });
+        }
+        if (await strategy.keepUnstaked()) {
+          await strategy.setKeepUnstaked(false, { from: governance });
         }
         if (!(await strategy.sell())) {
           await strategy.setSell(true, { from: governance });
@@ -2272,6 +3153,7 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       assert.equal(await strategy.pausedInvesting(), false);
       assert.equal(await strategy.sell(), true);
       assert.equal((await strategy.minStakeInterval()).toString(), "0");
+      assert.equal(await strategy.keepUnstaked(), false);
       assert.equal(await strategy.governance(), governanceBefore);
       assert.equal(await strategy.incentives(), incentivesBefore);
       assert.equal((await strategy.vault()).toLowerCase(), vault.address.toLowerCase());
@@ -2389,6 +3271,8 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         let profits = await strategyEvents(profitLogInReward, block);
         assert.equal(profits.length, 1);
         Utils.assertBNGte(profits[0].args.profitAmount.toString(), new BigNumber(bought[0].args.value.toString()).plus(claimed));
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 0, "should compound the AERO sold");
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the AERO sold");
 
         // with no WETH left, the next hard work (after the window, so that it claims) does not try to sell any
         await advanceToBlock(block + 7);
@@ -2794,11 +3678,18 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       await Utils.waitHours(13); // the controller's nextImplementationDelay is 12 hours
 
       // carried over: a stake inside its window, and a stakeSpacing and a minStakeInterval other than the defaults (an
-      // interval of 30 blocks, shorter than the 84 blocks of stakeSpacing, changes no stake below)
+      // interval of 30 blocks, shorter than the 84 blocks of stakeSpacing, changes no stake below), keepUnstaked
+      // switched on (until the window ends: inside it the stake stays either way), and what a failed compounding recorded
+      // as fee-paid (the stake's own hard work, with the pool's mint failing): nothing here, since that hard work sold all
+      // its AERO, neither pool token being AERO
       await strategy.setStakeSpacing(12, { from: governance });
       await strategy.setMinStakeInterval(30, { from: governance });
       try {
-        let block = await claimThenStake(await farmer2LP(10));
+        let block = await withPoolMintFailing(async () => await claimThenStake(await farmer2LP(10)));
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the stake's hard work should fail to compound");
+        let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        Utils.assertBNEq(aeroKept, 0);
+        await strategy.setKeepUnstaked(true, { from: governance });
         // finalizeUpgrade runs with the caller's address: an upgrade by anyone but governance reverts as a whole
         message = await revertMessage(proxy.upgrade({ from: farmer2 }), "only governance should complete the upgrade");
         assert.include(message, "Issue when finalizing the upgrade");
@@ -2817,6 +3708,8 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
             stakeSpacing: (await strategy.stakeSpacing()).toString(),
             minStakeInterval: (await strategy.minStakeInterval()).toString(),
             lastStakeBlock: (await strategy.lastStakeBlock()).toString(),
+            keepUnstaked: await strategy.keepUnstaked(),
+            feePaidReward: (await strategy.feePaidReward()).toString(),
             staked: (await gauge.balanceOf(strategy.address)).toString(),
             invested: (await strategy.investedUnderlyingBalance()).toString(),
             window: [window.minStakeBlocks.toString(), window.penaltyRate.toString(), window.windowEndBlock.toString(), window.inWindow].join(),
@@ -2826,19 +3719,32 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         assert.equal(before.window, ["7", "1000000", String(block + 7), true].join());
         assert.equal(before.minStakeInterval, "30");
         assert.equal(before.lastStakeBlock, String(block));
+        assert.equal(before.keepUnstaked, true);
+        // all the AERO held is what the failed compounding kept, whose fee it took: none here
+        assert.equal(before.feePaidReward, aeroKept.toFixed(), "the AERO kept should be recorded as fee-paid");
         await proxy.upgrade({ from: governance });
         assert.equal(await proxy.implementation(), newImplementation.address);
         assert.equal(await strategy.nextImplementation(), zeroAddress, "finalizeUpgrade should clear the schedule");
         assert.equal((await strategy.nextImplementationTimestamp()).toString(), "0");
         assert.deepEqual(await snapshot(), before);
 
-        // the upgraded strategy follows the same rules: it skips inside the window, and stakes 12 windows after the last stake
+        // the upgraded strategy follows the same rules: it skips inside the window (where kept unstaked or not, it cannot
+        // leave the gauge without a claim), and stakes 12 windows after the last stake
         await depositVault(farmer2, underlying, vault, await farmer2LP(10));
         let next = await doHardWork();
         assert.isBelow(next, block + 7, "should run inside the window");
         assert.equal((await strategyEvents("ClaimSkipped", next)).length, 1, "claim should be skipped");
         assert.equal((await strategyEvents("StakeSkipped", next)).length, 1, "stake should be skipped");
+        assert.equal((await gaugeEvents("Withdraw", next)).length, 0, "should not leave the gauge without a claim");
         assert.equal(await nextStakeBlock(), block + 84);
+        // and it compounds the pool tokens the failed compounding left, taking no fee: neither pool token is AERO, so its
+        // pool fee claim brought no AERO, and it holds none
+        let charged = (await strategyEvents(profitLogInReward, next)).reduce((total, profit) => total.plus(profit.args.profitAmount.toString()), new BigNumber(0));
+        console.log("after the upgrade: AERO carried over as fee-paid ", aeroKept.toFixed(), ", fee base ", charged.toFixed());
+        assert.equal((await strategyEvents(profitLogInReward, next)).length, 0, "should take no fee: it holds no AERO and its claim was skipped");
+        assert.equal((await poolEvents("Mint", next, strategy.address)).length, 1, "should compound the pool tokens left");
+        assert.equal((await strategy.feePaidReward()).toString(), "0", "a compounding that goes through should clear feePaidReward");
+        await strategy.setKeepUnstaked(false, { from: governance });
         // where the default stakeSpacing (10 windows) would stake, it claims and still waits: it uses the stored 12
         await advanceToBlock(block + 69);
         next = await doHardWork();
@@ -2852,6 +3758,9 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       } finally {
         await strategy.setStakeSpacing(10, { from: governance });
         await strategy.setMinStakeInterval(0, { from: governance });
+        if (await strategy.keepUnstaked()) {
+          await strategy.setKeepUnstaked(false, { from: governance });
+        }
       }
     });
   });
@@ -3012,13 +3921,20 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
         });
 
         // with Aero's gas limit back, the hard work sells the WETH into AERO, the AERO into the pool, and stakes
+        let lpBefore = await unstakedLP();
         let block = await doHardWork();
         assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
         let wethOut = await wethToken.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block });
         assert.equal(wethOut.length, 1, "should sell the WETH");
         Utils.assertBNEq(wethOut[0].args.value.toString(), amount);
         assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "should sell the AERO it bought");
-        assert.equal((await gaugeEvents("Deposit", block)).length, 1);
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 0, "should put the AERO into the pool");
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should put the AERO into the pool");
+        let minted = await mintedLP(block);
+        Utils.assertBNGt(minted, 0);
+        let deposits = await gaugeEvents("Deposit", block);
+        assert.equal(deposits.length, 1);
+        Utils.assertBNEq(deposits[0].args._amount.toString(), lpBefore.plus(minted));
       } finally {
         if (await strategy.isRewardToken(weth)) {
           await strategy.removeRewardToken(weth, { from: governance });
@@ -3742,8 +4658,9 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
     });
 
     it("Pays a user withdrawal from the gauge with far less gas than an emergency exit needs: user exits have no gas floor", async function() {
-      // only the best-effort exits (emergencyExit, leaving a switched-off gauge) need gaugeTapeGasLimit + 1,200,000 gas left
-      // before calling the gauge; a user withdrawal calls its withdraw directly, which needs a few hundred thousand
+      // only the best-effort exits (emergencyExit, and the hard work's exit from a gauge Aero switched off or while
+      // keepUnstaked is on) need gaugeTapeGasLimit + 1,200,000 gas left before calling the gauge; a user withdrawal calls
+      // its withdraw directly, which needs a few hundred thousand
       Utils.assertBNEq(await unstakedLP(), 0); // everything staked: the withdrawal reaches the gauge
       let floor = await exitGasFloor();
       assert.isBelow(900000, floor);
@@ -3872,6 +4789,46 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       await doHardWork(); // everything staked
     });
 
+    // the AERO the hard work in `block` brought in: its claim (neither pool token is AERO: its pool fee claims pay none)
+    async function newAero(block) {
+      return (await gaugeEvents("EmissionsClaimed", block)).reduce((total, claim) => total.plus(claim.args._rewardAmount.toString()), new BigNumber(0));
+    }
+
+    // the AERO the hard work in `block` took the fee on (its one ProfitLogInReward)
+    async function feeBase(block) {
+      let profits = await strategyEvents(profitLogInReward, block);
+      assert.equal(profits.length, 1, "should take the fee once");
+      return new BigNumber(profits[0].args.profitAmount.toString());
+    }
+
+    async function feePaidReward() {
+      return new BigNumber(await strategy.feePaidReward());
+    }
+
+    // the slot of feePaidReward (keccak256("eip1967.strategyStorage.feePaidReward") - 1), which the stale-value tests write
+    // in the strategy's storage: the proxy's, strategy.address
+    let feePaidRewardSlot = "0x" + web3.utils.toBN(web3.utils.keccak256("eip1967.strategyStorage.feePaidReward")).subn(1).toString(16).padStart(64, "0");
+
+    async function writeFeePaidReward(value) {
+      await hre.network.provider.send("hardhat_setStorageAt", [strategy.address, feePaidRewardSlot, "0x" + new BigNumber(value).toString(16).padStart(64, "0")]);
+    }
+
+    // makes sure farmer2 holds `amount` of AERO to send the strategy. Neither pool token is AERO, so farmer2's LP holds
+    // none: its AERO comes from the AERO dust test of "Aero failures", which buys some with WETH through the liquidator.
+    // Without that test (this describe run on its own) farmer2 buys it here the same way, and the path it sets stays set,
+    // as there
+    async function farmer2Aero(amount) {
+      if (new BigNumber(await aeroToken.balanceOf(farmer2)).lt(amount)) {
+        await universalLiquidatorRegistry.setPath(web3.utils.keccak256("aero"), [weth, usdc, aero], { from: addresses.ULOwner });
+        let universalLiquidator = await IUniversalLiquidator.at(await controller.universalLiquidator());
+        let wethAmount = "1000000000000000"; // 0.001 WETH, as in that test
+        await (await IWETH.at(weth)).deposit({ from: farmer2, value: wethAmount });
+        await wethToken.approve(universalLiquidator.address, wethAmount, { from: farmer2 });
+        await universalLiquidator.swap(weth, aero, wethAmount, 1, farmer2, { from: farmer2, gasPrice: keeperGasPrice });
+      }
+      Utils.assertBNGte(await aeroToken.balanceOf(farmer2), amount);
+    }
+
     it("Swaps a surplus of either pool token for the other through the pool, then mints, leaving almost nothing", async function() {
       // selling off: the hard work claims AERO but neither sells it nor puts it in the pool, and still compounds the pool
       // tokens the strategy holds: here one of them only, the USDC (token0), then the alUSDb (token1) behind 0.05% of
@@ -3905,10 +4862,11 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
           console.log("zap of ", name, ": held ($, 18 decimals): ", held.toFixed(), " swapped: ", (await dollars(swap.amount0In, swap.amount1In)).toFixed(),
             " minted LP worth: ", (await lpDollars(minted)).toFixed(), " left over: ", leftover.toFixed(), " (", leftover.toNumber() / held.toNumber(), ")");
           // what is left is a few USDC wei, about a millionth of what was held here (~5 millionths with a single probe): the
-          // zap's own swap shifts the pool's reserves, which leaves about (amount swapped / reserve) of it unpaired. A single
-          // probe adds only ~4e-6 on this pool (~8 USDC wei here), and that leftover grows past it at a few times this size,
-          // so unlike the volatile suite's, no bound here tells it apart. Pricing the swap of a token1 surplus with token0's
-          // probe (the zap before the fix) under-swaps by about the pool's fee: ~6 ten-thousandths left over here
+          // zap's own swap shifts the pool's ratio by about (amount swapped / its reserve) + (amount bought / its reserve),
+          // which leaves that share of what it bought unpaired. A single probe adds only ~4e-6 on this pool (~8 USDC wei
+          // here), and that leftover grows past it at a few times this size, so unlike the volatile suite's, no bound here
+          // tells it apart. Pricing the swap of a token1 surplus with token0's probe (the zap before the fix) under-swaps by
+          // about the pool's fee: ~6 ten-thousandths left over here
           Utils.assertBNGt(held, leftover.times(20000));
         }
       } finally {
@@ -3928,9 +4886,12 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
 
         await withSwapsPaused(async () => {
           let block = await doHardWork();
-          // no swap through the paused pool (Pool.swap would revert IsPaused, and the whole liquidation with it) ...
+          // no swap through the paused pool (Pool.swap would revert IsPaused and fail the compounding: CompoundFailed,
+          // nothing minted) ...
           assert.equal((await poolEvents("Swap", block, strategy.address)).length, 0, "the zap should not swap while swaps are paused");
           assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+          // the zap skips its swap: trying it would fail the compounding
+          assert.equal((await strategyEvents("CompoundFailed", block)).length, 0, "the zap should skip its swap while swaps are paused");
           // ... but the part in the pool's ratio is minted (Pool.mint has no pause check) and staked; the surplus waits
           assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should mint what is in the pool's ratio");
           Utils.assertBNGt(await mintedLP(block), 0);
@@ -4056,7 +5017,9 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
 
         let tx = await controller.doHardWork(vault.address, { from: governance, gasPrice: taxedGasPrice });
         let block = tx.receipt.blockNumber;
-        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the zap should not fail the pool's check");
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+        // the zap runs in the compounding, whose failures are reported as CompoundFailed
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 0, "the zap should not fail the pool's check");
         await zapFee(block);
         assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should mint");
         // the zap's split does not count the tax (its price probe quotes the base fee): it left some USDC unpaired
@@ -4069,13 +5032,16 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       let block = await doHardWork();
       assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
       assert.equal((await strategyEvents(profitLogInReward, block)).length, 1);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0, "should compound the USDC left unpaired");
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the USDC left unpaired");
 
       // with an AERO sale (selling on), at the same priority fee: the sale's swaps pay the tax too, the alUSDb leg twice (AERO
       // -> USDC, then USDC -> alUSDb through this pool), so the split comes out short of alUSDb, and the zap swaps USDC
       await Utils.advanceNBlock(600);
       let tx = await controller.doHardWork(vault.address, { from: governance, gasPrice: taxedGasPrice });
       block = tx.receipt.blockNumber;
-      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the sale and the zap should not fail the pool's check");
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the sale should not fail the pool's check");
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0, "the zap should not fail the pool's check");
       assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "should sell the AERO");
       let swap = await zapFee(block);
       Utils.assertBNGt(swap.amount0In, 0);
@@ -4089,6 +5055,1269 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       console.log("token0 left unpaired by the taxed sale's zap: ", token0Left.toFixed(), " (", token0Left.toNumber() / Number(swap.amount0In),
         " of what it swapped)");
       Utils.assertBNGt(new BigNumber(swap.amount0In).idiv(2), token0Left);
+    });
+
+    it("Keeps the AERO sale and its fee when the compounding after it fails, still stakes, and compounds the pool tokens left with the next hard work", async function() {
+      // the pool's mint fails (mintRevertsCode): only the compounding calls it, after the AERO sale, whose alUSDb leg swaps
+      // through this same pool, and its fee. The compounding fails as a whole, its own swap included, and leaves the sale and
+      // the fee done
+      await mineBlocks(600); // AERO to claim and sell
+      await depositVault(farmer2, underlying, vault, await farmer2LP(10)); // new LP
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compounding");
+      let lpBefore = await unstakedLP();
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let usdcBefore = new BigNumber(await usdcToken.balanceOf(strategy.address));
+      let alusdbBefore = new BigNumber(await alusdbToken.balanceOf(strategy.address));
+      let held;
+      await withPoolMintFailing(async () => {
+        let block = await doHardWork();
+        // the sale and its fee, on all the AERO the strategy held, as always
+        let claimed = (await gaugeEvents("EmissionsClaimed", block))[0].args._rewardAmount.toString();
+        let profits = await strategyEvents(profitLogInReward, block);
+        assert.equal(profits.length, 1, "the AERO sale and its fee should stay done");
+        let profit = new BigNumber(profits[0].args.profitAmount.toString());
+        Utils.assertBNEq(profit, aeroBefore.plus(claimed));
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the compounding's failure should not undo the sale");
+        // the AERO left the strategy for the fee and through the sale, a share for each pool token: neither is AERO, so all
+        // of it is sold
+        let forwarder = (await controller.rewardForwarder()).toLowerCase();
+        let aeroOut = await aeroToken.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block });
+        let fees = aeroOut.filter(transfer => transfer.args.to.toLowerCase() == forwarder);
+        let sales = aeroOut.filter(transfer => transfer.args.to.toLowerCase() != forwarder);
+        console.log("AERO out of the strategy: fee ", fees.map(transfer => transfer.args.value.toString()), " sold ",
+          sales.map(transfer => transfer.args.value.toString() + " to " + transfer.args.to));
+        assert.equal(fees.length, 1, "the fee");
+        assert.equal(sales.length, 2, "the sales of the USDC and the alUSDb shares");
+        Utils.assertBNEq(sales.reduce((total, sale) => total.plus(sale.args.value.toString()), new BigNumber(0)), profit.minus(fees[0].args.value.toString()));
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        // what the failed compounding records as fee-paid is the AERO it kept: none
+        assert.equal((await feePaidReward()).toFixed(), (await aeroToken.balanceOf(strategy.address)).toString(), "the AERO kept should be recorded as fee-paid");
+        // the compounding failed with the pool's own error, and as a whole: no swap of its own, no mint, no pool token sent
+        let failures = await strategyEvents("CompoundFailed", block);
+        assert.equal(failures.length, 1, "the compounding should fail without reverting");
+        assert.equal(failures[0].args.reason, "0xdeadbeef", "the pool's own revert data");
+        assert.equal((await poolEvents("Swap", block, strategy.address)).length, 0, "the zap's swap should be undone with the mint");
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 0);
+        Utils.assertBNEq(await mintedLP(block), 0);
+        for (let token of [usdcToken, alusdbToken]) {
+          let out = await token.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block });
+          assert.equal(out.length, 0, "no pool token should leave the strategy");
+        }
+        // so the pool tokens wait in the strategy: the USDC and the alUSDb the sale bought
+        Utils.assertBNGt(await usdcToken.balanceOf(strategy.address), usdcBefore);
+        Utils.assertBNGt(await alusdbToken.balanceOf(strategy.address), alusdbBefore);
+        held = await poolTokensHeld();
+        // and the idle LP is staked all the same
+        let deposits = await gaugeEvents("Deposit", block);
+        assert.equal(deposits.length, 1, "should still stake");
+        Utils.assertBNEq(deposits[0].args._amount.toString(), lpBefore);
+        Utils.assertBNEq(await unstakedLP(), 0);
+      });
+
+      // with the pool's mint back, the next hard work compounds them with what it claims: it mints LP to the strategy and
+      // stakes it, leaving almost nothing
+      let block = await doHardWork();
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should mint LP from the pool tokens left");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+      let leftover = await poolTokensHeld();
+      console.log("pool tokens left by the failed compounding ($, 18 decimals): ", held.toFixed(), " compounded with the next claim into LP worth: ",
+        (await lpDollars(minted)).toFixed(), " left over: ", leftover.toFixed());
+      Utils.assertBNGt(held, leftover.times(100)); // leftover below 1%
+      // neither pool token is AERO: the next hard work takes the fee on what it claims, and nothing else, and nothing is
+      // recorded as fee-paid
+      let claimed = (await gaugeEvents("EmissionsClaimed", block))[0].args._rewardAmount.toString();
+      let profits = await strategyEvents(profitLogInReward, block);
+      assert.equal(profits.length, 1);
+      Utils.assertBNEq(profits[0].args.profitAmount.toString(), claimed);
+      assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should leave feePaidReward at 0");
+      // and its sale sells all that the fee left of it (the volatile suite checks that its sale splits only that, the AERO
+      // kept for its pool going in unsold)
+      let sale = await rewardSale(block);
+      console.log("the next run's AERO sold ", sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left");
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the new AERO");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+    });
+
+    it("Reports a compounding failure without revert data as CompoundFailed too, keeps the AERO sale and its fee, and compounds the pool tokens with the next hard work", async function() {
+      // only Aero's own gas check error is re-raised from the compounding: a failure without revert data (an empty revert,
+      // as from a call that ran out of gas) is reported like the 0xdeadbeef of the test above, with the sale and its fee
+      // left done. Here the pool's mint reverts with no data (mintRevertsCode with emptyRevertCode)
+      await mineBlocks(600); // AERO to claim and sell
+      await depositVault(farmer2, underlying, vault, await farmer2LP(10)); // new LP
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compounding");
+      let lpBefore = await unstakedLP();
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let usdcBefore = new BigNumber(await usdcToken.balanceOf(strategy.address));
+      let alusdbBefore = new BigNumber(await alusdbToken.balanceOf(strategy.address));
+      let held;
+      await withPoolMintFailing(async () => {
+        let block = await doHardWork();
+        // the sale and its fee, on all the AERO the strategy held: neither pool token is AERO, so all of it is sold
+        let claimed = (await gaugeEvents("EmissionsClaimed", block))[0].args._rewardAmount.toString();
+        let profits = await strategyEvents(profitLogInReward, block);
+        assert.equal(profits.length, 1, "the AERO sale and its fee should stay done");
+        Utils.assertBNEq(profits[0].args.profitAmount.toString(), aeroBefore.plus(claimed));
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "a compounding failure without revert data should not undo the sale");
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        // the compounding failed as a whole, with the pool's empty revert data
+        let failures = await strategyEvents("CompoundFailed", block);
+        assert.equal(failures.length, 1, "the compounding should fail without reverting");
+        assert.include([null, "0x"], failures[0].args.reason, "the pool's own (empty) revert data");
+        assert.equal((await poolEvents("Swap", block, strategy.address)).length, 0, "the zap's swap should be undone with the mint");
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 0);
+        Utils.assertBNEq(await mintedLP(block), 0);
+        // so the pool tokens wait in the strategy, and the idle LP is staked all the same
+        Utils.assertBNGt(await usdcToken.balanceOf(strategy.address), usdcBefore);
+        Utils.assertBNGt(await alusdbToken.balanceOf(strategy.address), alusdbBefore);
+        held = await poolTokensHeld();
+        let deposits = await gaugeEvents("Deposit", block);
+        assert.equal(deposits.length, 1, "should still stake");
+        Utils.assertBNEq(deposits[0].args._amount.toString(), lpBefore);
+        Utils.assertBNEq(await unstakedLP(), 0);
+        // what the failed compounding records as fee-paid is the AERO it kept: none
+        assert.equal((await feePaidReward()).toFixed(), (await aeroToken.balanceOf(strategy.address)).toString(), "the AERO kept should be recorded as fee-paid");
+        console.log("compounding failure without revert data (", failures[0].args.reason, "): AERO sold with its fee ",
+          profits[0].args.profitAmount.toString(), ", pool tokens left ($, 18 decimals): ", held.toFixed());
+      }, emptyRevertCode);
+
+      // with the pool's mint back, the next hard work compounds them into LP and stakes it, leaving almost nothing
+      let block = await doHardWork();
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should mint LP from the pool tokens left");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+      let leftover = await poolTokensHeld();
+      console.log("pool tokens left by the compounding failure without revert data ($, 18 decimals): ", held.toFixed(),
+        " compounded with the next claim into LP worth: ", (await lpDollars(minted)).toFixed(), " left over: ", leftover.toFixed());
+      Utils.assertBNGt(held, leftover.times(100)); // leftover below 1%
+      // the fee is taken on what the run brought only, as after the 0xdeadbeef failure above, and nothing is recorded
+      Utils.assertBNEq(await feeBase(block), await newAero(block));
+      assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should leave feePaidReward at 0");
+      // and its sale sells all that the fee left of it, as in the test above
+      let sale = await rewardSale(block);
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the new AERO");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+    });
+
+    it("Reports a failed compounding with selling off, goes on with the hard work, and compounds the pool tokens with the next one", async function() {
+      await strategy.setSell(false, { from: governance });
+      try {
+        // only pool tokens to compound (the AERO, reserved, is none of them): the USDC behind 0.05% of farmer2's LP
+        let usdcIn = (await burnLP(2000))[0];
+        await usdcToken.transfer(strategy.address, usdcIn.toFixed(), { from: farmer2 });
+        await depositVault(farmer2, underlying, vault, await farmer2LP(10)); // new LP
+        let lpBefore = await unstakedLP();
+        let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        let usdcHeld = new BigNumber(await usdcToken.balanceOf(strategy.address));
+        let alusdbHeld = new BigNumber(await alusdbToken.balanceOf(strategy.address));
+        await withPoolMintFailing(async () => {
+          let block = await doHardWork();
+          let notCollected = await strategyEvents(profitsNotCollected, block);
+          assert.equal(notCollected.length, 1, "should report the profits as not collected");
+          assert.equal(notCollected[0].args.sell, false);
+          assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee");
+          let failures = await strategyEvents("CompoundFailed", block);
+          assert.equal(failures.length, 1, "the compounding should fail without reverting");
+          assert.equal(failures[0].args.reason, "0xdeadbeef", "the pool's own revert data");
+          assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+          // the hard work goes on: it claims, and stakes the idle LP
+          let claimed = await gaugeEvents("EmissionsClaimed", block);
+          assert.equal(claimed.length, 1, "should claim");
+          let deposits = await gaugeEvents("Deposit", block);
+          assert.equal(deposits.length, 1, "should still stake");
+          Utils.assertBNEq(deposits[0].args._amount.toString(), lpBefore);
+          // and the pool tokens wait: none left the strategy (the zap's swap was undone with the mint), and it keeps the
+          // AERO it claimed
+          assert.equal((await poolEvents("Swap", block, strategy.address)).length, 0, "the zap's swap should be undone with the mint");
+          Utils.assertBNEq(await mintedLP(block), 0);
+          for (let token of [usdcToken, alusdbToken, aeroToken]) {
+            let out = await token.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block });
+            assert.equal(out.length, 0, "no pool token or AERO should leave the strategy");
+          }
+          let feeClaimed = (await feeClaims(block)).reduce((total, claim) => [total[0].plus(claim.returnValues.amount0), total[1].plus(claim.returnValues.amount1)],
+            [new BigNumber(0), new BigNumber(0)]);
+          Utils.assertBNEq(await usdcToken.balanceOf(strategy.address), usdcHeld.plus(feeClaimed[0]));
+          Utils.assertBNEq(await alusdbToken.balanceOf(strategy.address), alusdbHeld.plus(feeClaimed[1]));
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), aeroBefore.plus(claimed[0].args._rewardAmount.toString()));
+          // that AERO was reserved, its fee not taken: none of it is recorded as fee-paid
+          assert.equal((await feePaidReward()).toFixed(), "0", "AERO whose fee was not taken should not be recorded as fee-paid");
+        });
+
+        // with the pool's mint back, the next hard work (selling still off) zaps the USDC into LP
+        let usdcWaiting = new BigNumber(await usdcToken.balanceOf(strategy.address));
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+        let zap = await poolEvents("Swap", block, strategy.address);
+        assert.equal(zap.length, 1, "should zap the USDC");
+        Utils.assertBNGt(zap[0].returnValues.amount0In, 0);
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1);
+        let minted = await mintedLP(block);
+        Utils.assertBNGt(minted, 0);
+        let deposits = await gaugeEvents("Deposit", block);
+        assert.equal(deposits.length, 1, "should stake the LP minted");
+        Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+        Utils.assertBNGt(await dollars(usdcWaiting, 0), (await poolTokensHeld()).times(1000));
+        assert.equal((await feePaidReward()).toFixed(), "0", "AERO whose fee was not taken should not be recorded as fee-paid");
+      } finally {
+        await strategy.setSell(true, { from: governance });
+      }
+    });
+
+    it("Takes the fee once through two failed compoundings in a row: each run on what it brings only, until a compounding goes through and clears the record, and the next run on all it holds", async function() {
+      // neither pool token is AERO: each sale sells all the AERO, so a failed compounding keeps none and records nothing as
+      // fee-paid, and each run's fee base is the AERO it holds and brings (the same steps as in the volatile suite, where
+      // the AERO kept for the pool is recorded)
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compoundings");
+      let held;
+      await withPoolMintFailing(async () => {
+        // the first: the fee on what it brings and on all the AERO the strategy held (the selling-off test above reserved it)
+        await mineBlocks(600); // AERO to claim and sell
+        await depositVault(farmer2, underlying, vault, await farmer2LP(10)); // new LP: idle during the sale, it earns pool fees on it
+        let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail without reverting");
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the compounding's failure should not undo the sale");
+        Utils.assertBNEq(await feeBase(block), aeroHeld.plus(await newAero(block)));
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        assert.equal((await feePaidReward()).toFixed(), "0", "a failed compounding that kept no AERO should record none as fee-paid");
+
+        // the second: the fee on its own claim only
+        await mineBlocks(600);
+        await depositVault(farmer2, underlying, vault, await farmer2LP(10));
+        block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail again without reverting");
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the compounding's failure should not undo the sale");
+        let brought = await newAero(block);
+        Utils.assertBNEq(await feeBase(block), brought);
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        assert.equal((await feePaidReward()).toFixed(), "0", "a failed compounding that kept no AERO should record none as fee-paid");
+        held = await poolTokensHeld();
+        let sale = await rewardSale(block);
+        console.log("two failed compoundings: the second's fee base: AERO claimed ", brought.toFixed(), "; its AERO sold ", sale.sold.toFixed(), " of the ",
+          sale.split.toFixed(), " the fee left; pool tokens held ($, 18 decimals): ", held.toFixed());
+        // the second sale sells all that the fee left of what it brought (the volatile suite checks that it splits only that)
+        assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the second sale should sell all that the fee left of what it brought");
+      });
+
+      // with the pool's mint back, the compounding goes through: the fee on its own claim only, the pool tokens into LP,
+      // which is staked
+      await mineBlocks(600);
+      let block = await doHardWork();
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), await newAero(block));
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should mint LP from the pool tokens left");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+      assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should leave feePaidReward at 0");
+      let leftover = await poolTokensHeld();
+      console.log("pool tokens left by two failed compoundings ($, 18 decimals): ", held.toFixed(), " compounded with the next claim into LP worth: ",
+        (await lpDollars(minted)).toFixed(), " left over: ", leftover.toFixed());
+      Utils.assertBNGt(held, leftover.times(100)); // leftover below 1%
+      // its sale sells all that the fee left of what it brought
+      let sale = await rewardSale(block);
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of what it brought");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+
+      // the next run takes the fee on all the AERO it holds, and on what it brings
+      await mineBlocks(600);
+      let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      block = await doHardWork();
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), aeroHeld.plus(await newAero(block)));
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Compounds what a failed compounding left, without a fee, when selling is switched off before the next hard work, also after a compounding that fails again there, and takes the fee on the rewards those runs reserved once selling is back on", async function() {
+      // with selling off a hard work takes no fee and reserves the AERO whose fee it has not taken: its claim. The pool
+      // tokens the failed compounding left (its sale sold all the AERO, neither pool token being AERO) go into the pool. A
+      // compounding that fails again with selling off must keep the record it finds, as in the volatile suite, where the
+      // failed compounding recorded the AERO it kept for the pool; here the test writes a record below the AERO held into
+      // the strategy's storage, as the stale-value tests below do
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compounding");
+      await mineBlocks(600); // AERO to claim and sell
+      await depositVault(farmer2, underlying, vault, await farmer2LP(10)); // new LP: idle during the sale, it earns pool fees on it
+      let held;
+      await withPoolMintFailing(async () => {
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail without reverting");
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "the AERO sale and its fee should stay done");
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        assert.equal((await feePaidReward()).toFixed(), "0", "a failed compounding that kept no AERO should record none as fee-paid");
+        held = await poolTokensHeld();
+      });
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+
+      await strategy.setSell(false, { from: governance });
+      try {
+        let reserved, block;
+        await writeFeePaidReward(recorded);
+        try {
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+          // the first hard work with selling off fails to compound too (the pool's mint still failing): it keeps the record
+          // it found, and records none of the new rewards it reserves, whose fee it has not taken
+          await withPoolMintFailing(async () => {
+            let failed = await doHardWork();
+            let notCollected = await strategyEvents(profitsNotCollected, failed);
+            assert.equal(notCollected.length, 1, "should report the profits as not collected");
+            assert.equal(notCollected[0].args.sell, false);
+            assert.equal((await strategyEvents(profitLogInReward, failed)).length, 0, "should take no fee");
+            let failures = await strategyEvents("CompoundFailed", failed);
+            assert.equal(failures.length, 1, "the compounding should fail again without reverting");
+            assert.equal(failures[0].args.reason, "0xdeadbeef", "the pool's own revert data");
+            assert.equal((await strategyEvents("LiquidationFailed", failed)).length, 0);
+            reserved = await newAero(failed);
+            Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), sent.plus(reserved));
+            assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(),
+              "a compounding that fails with selling off should keep the record it found, and not record the rewards it reserved");
+          });
+          // the pool tokens the next one compounds: all those held (that run's pool fee claim added to them)
+          held = await poolTokensHeld();
+          block = await doHardWork();
+          assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should leave feePaidReward at 0");
+        } finally {
+          await writeFeePaidReward(0);
+        }
+        let notCollected = await strategyEvents(profitsNotCollected, block);
+        assert.equal(notCollected.length, 1, "should report the profits as not collected");
+        assert.equal(notCollected[0].args.sell, false);
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee");
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+        // what the failed compoundings left goes into the pool, and the LP minted is staked ...
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+        let minted = await mintedLP(block);
+        Utils.assertBNGt(minted, 0);
+        let deposits = await gaugeEvents("Deposit", block);
+        assert.equal(deposits.length, 1, "should stake the LP minted");
+        Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+        // ... while the new rewards of both runs, reserved, stay out of it with the AERO sent (no pool token here): the
+        // strategy keeps them, and at most dust of the pool tokens
+        reserved = reserved.plus(await newAero(block));
+        Utils.assertBNGt(reserved, 0);
+        let aeroLeft = new BigNumber(await aeroToken.balanceOf(strategy.address)).minus(sent).minus(reserved);
+        let leftover = await poolTokensHeld();
+        console.log("selling off after a failed compounding: pool tokens held ($, 18 decimals): ", held.toFixed(), " compounded into LP worth ",
+          (await lpDollars(minted)).toFixed(), ", left over: ", leftover.toFixed(), " (", leftover.toNumber() / held.toNumber(), "); AERO reserved ", reserved.toFixed(),
+          ", AERO left besides it and the AERO sent ", aeroLeft.toFixed());
+        Utils.assertBNEq(aeroLeft, 0);
+        // the pool tokens left below 1% of those held: measured 5.2e-6 of them; not compounding while selling is off (C5a)
+        // leaves all of them
+        Utils.assertBNGt(held, leftover.times(100));
+      } finally {
+        await strategy.setSell(true, { from: governance });
+      }
+
+      // with selling back on, the next hard work takes the fee on all the AERO it holds (the rewards reserved while selling
+      // was off, and the AERO sent: the compounding that went through cleared the record, so the part of it the record
+      // covered is charged again, which only a record written by the test shows on this pool) and on what it brings, and
+      // sells all of it
+      let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), aeroHeld.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Compounds what a failed compounding left, without a fee, with a next hard work that brings only reward dust (its claim fails)", async function() {
+      // the next hard work's claim fails (Aero's minting paused): it brings no AERO, and holds only the AERO dust farmer2
+      // sends (the failed run sold all its AERO), below MIN_REWARD, so it takes no fee and sells nothing (the reward-dust
+      // path): the dust waits for the next claim. The pool tokens left still go into the pool. No new LP before the failed
+      // run, as in the volatile suite: nothing is idle in the strategy during its sale, so it is owed no pool fees
+      // afterwards either
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compounding");
+      await mineBlocks(600); // AERO to claim and sell
+      let dust = new BigNumber("1000000000000"); // a tenth of MIN_REWARD (1e13)
+      let held;
+      await withPoolMintFailing(async () => {
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail without reverting");
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "the AERO sale and its fee should stay done");
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        assert.equal((await feePaidReward()).toFixed(), "0", "a failed compounding that kept no AERO should record none as fee-paid");
+        held = await poolTokensHeld();
+      });
+      let pending = await pendingFees();
+      Utils.assertBNEq(new BigNumber(pending.amount0).plus(pending.amount1), 0);
+      // AERO dust whose fee was not taken: farmer2's (farmer2Aero)
+      await farmer2Aero(dust);
+      await aeroToken.transfer(strategy.address, dust.toFixed(), { from: farmer2 });
+
+      let block;
+      await leafVoter.setChainStatus(2, { from: penaltyAdmin }); // Paused: minting reverts
+      try {
+        block = await doHardWork();
+      } finally {
+        await leafVoter.setChainStatus(1, { from: penaltyAdmin }); // Active again
+      }
+      let failures = await strategyEvents("ClaimFailed", block);
+      assert.equal(failures.length, 1, "the claim should fail without reverting");
+      assert.notEqual(failures[0].args.reason, insufficientGasError, "minting paused, not Aero's gas check");
+      Utils.assertBNEq(await newAero(block), 0);
+      assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee on dust: the run brought no AERO");
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      // the pool tokens go into the pool, and the LP minted is staked (no window: no need for the claim)
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+      let leftover = await poolTokensHeld();
+      console.log("reward dust after a failed compounding: pool tokens held ($, 18 decimals): ", held.toFixed(), " compounded into LP worth ",
+        (await lpDollars(minted)).toFixed(), ", left over: ", leftover.toFixed(), " (", leftover.toNumber() / held.toNumber(), "); AERO dust kept ",
+        (await aeroToken.balanceOf(strategy.address)).toString());
+      // the pool tokens left below 1% of those held: measured 1.6e-6 to 3e-6 of them; compounding only after a reward sale
+      // (C5d) leaves all of them
+      Utils.assertBNGt(held, leftover.times(100));
+      // the dust, whose fee was not taken, stays in the strategy: AERO is no pool token here, nothing moves it
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), dust);
+      assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should leave feePaidReward at 0");
+
+      // the next claim takes the fee on the dust and on what it brings, and sells all of it
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), dust.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Records as fee-paid the AERO a failed compounding kept, never the reward dust beside it, when the compounding fails again in a hard work that brings only dust", async function() {
+      // the reward-dust path reserves the AERO whose fee was not taken (the dust): when its compounding fails, the record
+      // must leave that dust out, so that the next claim takes the fee on it. After a failed compounding (which keeps no
+      // AERO here, neither pool token being AERO), farmer2 sends the strategy AERO dust, and the next hard work, whose claim
+      // fails (minting paused), fails to compound the pool tokens left again (the pool's mint still failing)
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compoundings");
+      await mineBlocks(600); // AERO to claim and sell
+      let dust = new BigNumber("1000000000000"); // a tenth of MIN_REWARD (1e13)
+      await withPoolMintFailing(async () => {
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail without reverting");
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "the AERO sale and its fee should stay done");
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        assert.equal((await feePaidReward()).toFixed(), "0", "a failed compounding that kept no AERO should record none as fee-paid");
+
+        // AERO dust whose fee was not taken: farmer2's (farmer2Aero)
+        await farmer2Aero(dust);
+        await aeroToken.transfer(strategy.address, dust.toFixed(), { from: farmer2 });
+        await leafVoter.setChainStatus(2, { from: penaltyAdmin }); // Paused: minting reverts
+        try {
+          block = await doHardWork();
+        } finally {
+          await leafVoter.setChainStatus(1, { from: penaltyAdmin }); // Active again
+        }
+        assert.equal((await strategyEvents("ClaimFailed", block)).length, 1, "the claim should fail without reverting");
+        Utils.assertBNEq(await newAero(block), 0);
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee on dust");
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail again without reverting");
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), dust);
+        assert.equal((await feePaidReward()).toFixed(), "0", "the reward dust, whose fee was not taken, should not be recorded as fee-paid");
+      });
+
+      // with the pool's mint back, the next claim takes the fee on the dust and on what it brings, and sells all of it
+      let block = await doHardWork();
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), dust.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should leave feePaidReward at 0");
+      let sale = await rewardSale(block);
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the dust and the new AERO");
+    });
+
+    it("Clamps a stale feePaidReward above the AERO it holds, with selling on or off: the liquidation goes through without a fee on that AERO, compounds, and clears the value", async function() {
+      // the strategy only records AERO it holds, but a stale value above that (say, from another implementation) must not
+      // underflow the liquidation: feePaidReward is clamped to the AERO held at its start. The test writes one into the
+      // strategy's storage, the proxy's: strategy.address is the proxy (the implementation has no implementation() to
+      // answer). Reading the stale value back below is the control that the write reached the strategy's storage. The
+      // slot check guards the test's own formula, which must give the contract's _FEE_PAID_REWARD_SLOT literal (the
+      // volatile suite checks that the contract writes there, after a real failed compounding)
+      assert.equal(feePaidRewardSlot, "0xdee4b1c857a7cb713eed053196a5167e138327b62a7962ed114649742e13d192", "the slot of feePaidReward");
+      await (await StrategyProxy.at(strategy.address)).implementation();
+      assert.equal((await feePaidReward()).toFixed(), "0");
+      let stale = new BigNumber(2).pow(255);
+      // a pool token to compound, as in the volatile suite: the USDC behind 0.05% of farmer2's LP
+      let usdcIn = (await burnLP(2000))[0];
+      await usdcToken.transfer(strategy.address, usdcIn.toFixed(), { from: farmer2 });
+      await mineBlocks(600); // AERO to claim
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let held = await poolTokensHeld();
+      let block;
+      await writeFeePaidReward(stale);
+      try {
+        assert.equal((await feePaidReward()).toFixed(), stale.toFixed(), "the test should write feePaidReward into the strategy's storage");
+        block = await doHardWork();
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear even a stale feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      // the clamp keeps the fee base from underflowing: the liquidation goes through ...
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the clamp should keep the liquidation from underflowing");
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      // ... and counts all the AERO held at its start as fee-paid, the new claim included: this run takes no fee. On this
+      // pool that AERO is no pool token, so it is not sold either (no sale without the fee): it waits for the next run,
+      // which takes the fee on it. A stale value only delays the sale here, once: the compounding clears it
+      let claims = await gaugeEvents("EmissionsClaimed", block);
+      assert.equal(claims.length, 1, "should claim");
+      let total = aeroBefore.plus(await newAero(block));
+      assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee on the AERO the clamped value covers");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), total);
+      // the USDC goes into the pool, and the LP minted is staked
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the USDC");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+      let leftover = await poolTokensHeld();
+      console.log("stale feePaidReward: AERO held at the liquidation ", total.toFixed(), " (claimed ", claims[0].args._rewardAmount.toString(),
+        ") kept without a fee; pool tokens held ($, 18 decimals): ", held.toFixed(), " compounded into LP worth ", (await lpDollars(minted)).toFixed(), ", left over: ", leftover.toFixed(),
+        " (", leftover.toNumber() / held.toNumber(), ")");
+      // the pool tokens left below 1% of those held: measured 5.5e-7 to 9e-7 of them; compounding only after a reward sale
+      // (C5d: the clamped value leaves nothing to sell) leaves all of them
+      Utils.assertBNGt(held, leftover.times(100));
+
+      // with selling off, the same stale value must not underflow the liquidation either: clamped to the AERO held, it
+      // counts all of it as fee-paid, so none of it is reserved (no fee is taken with selling off anyway; on this pool that
+      // AERO stays all the same, being no pool token), and the pool tokens go into the pool: the USDC behind another 0.05%
+      // of farmer2's LP
+      usdcIn = (await burnLP(2000))[0];
+      await usdcToken.transfer(strategy.address, usdcIn.toFixed(), { from: farmer2 });
+      await mineBlocks(600); // AERO to claim
+      aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      await strategy.setSell(false, { from: governance });
+      try {
+        await writeFeePaidReward(stale);
+        try {
+          assert.equal((await feePaidReward()).toFixed(), stale.toFixed(), "the test should write feePaidReward into the strategy's storage");
+          block = await doHardWork();
+          assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0, "the clamp should keep the liquidation from underflowing with selling off too");
+          assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear even a stale feePaidReward");
+        } finally {
+          await writeFeePaidReward(0);
+        }
+      } finally {
+        await strategy.setSell(true, { from: governance });
+      }
+      let notCollected = await strategyEvents(profitsNotCollected, block);
+      assert.equal(notCollected.length, 1, "should report the profits as not collected");
+      assert.equal(notCollected[0].args.sell, false);
+      assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee with selling off");
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      claims = await gaugeEvents("EmissionsClaimed", block);
+      assert.equal(claims.length, 1, "should claim");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), aeroBefore.plus(await newAero(block)));
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the USDC");
+      minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+      console.log("stale feePaidReward with selling off: AERO kept ", (await aeroToken.balanceOf(strategy.address)).toString(), " (claimed ", claims[0].args._rewardAmount.toString(),
+        "); pool tokens compounded into LP worth ", (await lpDollars(minted)).toFixed(), " ($, 18 decimals), left over: ", (await poolTokensHeld()).toFixed());
+
+      // the next run takes the fee on all the AERO it holds again, and on what it brings, and sells all of it
+      let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), aeroHeld.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Counts a stale feePaidReward below the AERO it holds as fee-paid: the fee and the sale's split leave that AERO out, and the value is cleared", async function() {
+      // a stale value below the AERO held counts as AERO whose fee was taken: the run takes the fee on the rest of the AERO it
+      // holds and on what it brings, and sells what the fee left of that only. On this pool the fee-paid AERO is no pool
+      // token, so the compounding leaves it too: it waits in the strategy for the next run, which takes the fee on it (the
+      // compounding cleared the record). The test writes the value into the strategy's storage, as in the test above
+      assert.equal((await feePaidReward()).toFixed(), "0");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0); // the run above sold all of it
+      // AERO for the strategy to hold before the run: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      await mineBlocks(600); // AERO to claim
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let stale = aeroBefore.idiv(2);
+      Utils.assertBNGt(stale, 0);
+      let block;
+      await writeFeePaidReward(stale);
+      try {
+        assert.equal((await feePaidReward()).toFixed(), stale.toFixed(), "the test should write feePaidReward into the strategy's storage");
+        block = await doHardWork();
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear the stale feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      let claims = await gaugeEvents("EmissionsClaimed", block);
+      assert.equal(claims.length, 1, "should claim");
+      // the fee on all the AERO held at the liquidation but the stale value ...
+      let total = aeroBefore.plus(await newAero(block));
+      Utils.assertBNEq(await feeBase(block), total.minus(stale));
+      // ... and the sale sells all that the fee left of that, and nothing else: the stale value's AERO stays
+      let sale = await rewardSale(block);
+      let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      console.log("stale feePaidReward below the AERO held: AERO held at the liquidation ", total.toFixed(), " (claimed ", claims[0].args._rewardAmount.toString(),
+        "), stale value ", stale.toFixed(), "; AERO sold ", sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left; AERO kept ", aeroKept.toFixed());
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the AERO not counted as fee-paid");
+      assert.equal(aeroKept.toFixed(), stale.toFixed(), "the AERO the stale value covers should stay unsold");
+      // the pool tokens the sale bought go into the pool, and the LP minted is staked
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens the sale bought");
+      let minted = await mintedLP(block);
+      Utils.assertBNGt(minted, 0);
+      let deposits = await gaugeEvents("Deposit", block);
+      assert.equal(deposits.length, 1, "should stake the LP minted");
+      Utils.assertBNEq(deposits[0].args._amount.toString(), minted);
+
+      // the next run takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), stale.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through a liquidation that fails as a whole, and takes the fee once with the next one that goes through", async function() {
+      // a liquidation that fails as a whole (here its AERO sale, whose alUSDb leg goes through this pool, while Aero has
+      // paused swaps) undoes its own fee (it fails before its compounding, so it writes no record), and must not touch the
+      // record it found: the next run that goes through still finds that AERO fee-paid. On this pool a failed compounding
+      // records nothing (its sale sold all the AERO), so the test writes a record below the AERO held into the strategy's
+      // storage, as the stale-value tests do
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the failed compounding");
+      await mineBlocks(600); // AERO to claim and sell
+      await withPoolMintFailing(async () => {
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 1, "the compounding should fail without reverting");
+        assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "the AERO sale and its fee should stay done");
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+        assert.equal((await feePaidReward()).toFixed(), "0", "a failed compounding that kept no AERO should record none as fee-paid");
+      });
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      let aeroHeld, block;
+      await writeFeePaidReward(recorded);
+      try {
+        assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+        // the next hard work claims, so that it tries to sell what it brought, and that sale fails
+        await mineBlocks(600);
+        let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        await withSwapsPaused(async () => {
+          let paused = await doHardWork();
+          assert.equal((await gaugeEvents("EmissionsClaimed", paused)).length, 1, "the claim should go through, so that the sale is tried");
+          let failures = await strategyEvents("LiquidationFailed", paused);
+          assert.equal(failures.length, 1, "the AERO sale should fail the whole liquidation, without reverting");
+          assert.equal(failures[0].args.reason, web3.eth.abi.encodeFunctionSignature("IsPaused()"), "the pool's own error");
+          assert.equal((await strategyEvents(profitLogInReward, paused)).length, 0, "the fee should be undone with the liquidation");
+          assert.equal((await strategyEvents("CompoundFailed", paused)).length, 0, "the liquidation should fail before its compounding");
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), aeroBefore.plus(await newAero(paused)));
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "a liquidation that fails as a whole should keep the record");
+        });
+
+        // the next hard work takes the fee once: on all the AERO it holds but the recorded AERO, and on what it brings. It
+        // sells what the fee left of that only, the recorded AERO stays (no pool token here), and the record is cleared
+        aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        block = await doHardWork();
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), aeroHeld.minus(recorded).plus(await newAero(block)));
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      let sale = await rewardSale(block);
+      let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      console.log("after a liquidation that failed as a whole: AERO recorded as fee-paid ", recorded.toFixed(), " of the ", aeroHeld.toFixed(), " held; AERO sold ",
+        sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left; AERO kept ", aeroKept.toFixed());
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the AERO not recorded as fee-paid");
+      assert.equal(aeroKept.toFixed(), recorded.toFixed(), "the recorded AERO should stay unsold");
+
+      // the next run takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), recorded.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through a withdrawAll, its exit and a liquidation there that fails as a whole, and takes the fee once with the next withdrawAll", async function() {
+      // withdrawAll (a rebalance, a migration, the last share's withdrawal) takes the whole stake out first, then claims and
+      // liquidates on its own: neither that exit nor a liquidation that fails as a whole there may forget the record it
+      // finds. On this pool a failed compounding records nothing (its sale sells all the AERO), so the test writes a record
+      // below the AERO held into the strategy's storage, as the stale-value tests do
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the test writes a record");
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      await mineBlocks(600); // AERO to claim and sell
+      let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+      Utils.assertBNGt(staked, 0);
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let restaked;
+      try {
+        await writeFeePaidReward(recorded);
+        try {
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+          // a withdrawAll whose claim brings AERO to sell, and whose sale fails (swaps paused, for its alUSDb leg): it takes
+          // the whole stake out and hands all the LP to the vault, its liquidation fails as a whole, and the record stays
+          await withSwapsPaused(async () => {
+            let total = new BigNumber(await vault.underlyingBalanceWithInvestment());
+            let tx = await vault.withdrawAll({ from: governance, gasPrice: keeperGasPrice });
+            let paused = tx.receipt.blockNumber;
+            let withdrawn = await gaugeEvents("Withdraw", paused);
+            assert.equal(withdrawn.length, 1, "should take the whole stake out");
+            Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+            Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+            assert.equal((await gaugeEvents("EmissionsClaimed", paused)).length, 1, "the claim should go through, so that the sale is tried");
+            let failures = await strategyEvents("LiquidationFailed", paused);
+            assert.equal(failures.length, 1, "the AERO sale should fail the whole liquidation, without reverting withdrawAll");
+            assert.equal(failures[0].args.reason, web3.eth.abi.encodeFunctionSignature("IsPaused()"), "the pool's own error");
+            assert.equal((await strategyEvents(profitLogInReward, paused)).length, 0, "the fee should be undone with the liquidation");
+            assert.equal((await strategyEvents("CompoundFailed", paused)).length, 0, "the liquidation should fail before its compounding");
+            Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), aeroBefore.plus(await newAero(paused)));
+            Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+            Utils.assertBNGte(await vault.underlyingBalanceInVault(), total);
+            assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "neither withdrawAll's exit nor its failed liquidation should touch the record");
+          });
+
+          // the next withdrawAll takes the fee once: on all the AERO it holds but the recorded AERO, and on what it brings.
+          // It sells what the fee left of that only, the recorded AERO stays (no pool token here), the LP minted goes to the
+          // vault, and the record is cleared
+          let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+          let tx = await vault.withdrawAll({ from: governance, gasPrice: keeperGasPrice });
+          let block = tx.receipt.blockNumber;
+          assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+          assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+          assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+          Utils.assertBNEq(await feeBase(block), aeroHeld.minus(recorded).plus(await newAero(block)));
+          assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens the sale bought");
+          Utils.assertBNGt(await mintedLP(block), 0);
+          Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+          let sale = await rewardSale(block);
+          let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+          console.log("withdrawAll after a written record: AERO recorded as fee-paid ", recorded.toFixed(), " of the ", aeroHeld.toFixed(), " held; AERO sold ",
+            sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left; AERO kept ", aeroKept.toFixed());
+          assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the AERO not recorded as fee-paid");
+          assert.equal(aeroKept.toFixed(), recorded.toFixed(), "the recorded AERO should stay unsold");
+        } finally {
+          await writeFeePaidReward(0);
+        }
+      } finally {
+        // the next hard work stakes all the LP again, also when a check above fails, so that the tests below find it staked
+        restaked = await doHardWork();
+      }
+      // and it takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      assert.equal((await gaugeEvents("Deposit", restaked)).length, 1, "should stake everything again");
+      Utils.assertBNEq(await unstakedLP(), 0);
+      Utils.assertBNEq(await feeBase(restaked), recorded.plus(await newAero(restaked)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through a compounding that fails in withdrawAll, still hands all the LP to the vault, and compounds the pool tokens without a fee on the recorded AERO with the next withdrawAll", async function() {
+      // withdrawAll (a rebalance, a migration, the last share's withdrawal) takes the whole stake out, then claims and
+      // liquidates on its own: a compounding that fails there is reported as in a hard work (CompoundFailed, not
+      // LiquidationFailed: its sale and fee stay done), keeps the record, and all the LP still goes to the vault. On this
+      // pool the sale sells all the AERO, so the test writes a record below the AERO held into the strategy's storage, as
+      // the stale-value tests do: the sale leaves that AERO unsold, and the failed compounding records it again
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the test writes a record");
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      await mineBlocks(600); // AERO to claim and sell
+      let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+      Utils.assertBNGt(staked, 0);
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let restaked;
+      try {
+        await writeFeePaidReward(recorded);
+        try {
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+          await withPoolMintFailing(async () => {
+            let total = new BigNumber(await vault.underlyingBalanceWithInvestment());
+            let tx = await vault.withdrawAll({ from: governance, gasPrice: keeperGasPrice });
+            let failed = tx.receipt.blockNumber;
+            let withdrawn = await gaugeEvents("Withdraw", failed);
+            assert.equal(withdrawn.length, 1, "should take the whole stake out");
+            Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+            Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+            let failures = await strategyEvents("CompoundFailed", failed);
+            assert.equal(failures.length, 1, "the compounding should fail without reverting withdrawAll");
+            assert.equal(failures[0].args.reason, "0xdeadbeef", "the pool's own revert data");
+            assert.equal((await strategyEvents("LiquidationFailed", failed)).length, 0, "the compounding's failure should not undo the sale");
+            assert.equal((await poolEvents("Swap", failed, strategy.address)).length, 0, "the zap's swap should be undone with the mint");
+            Utils.assertBNEq(await mintedLP(failed), 0);
+            // the fee on all the AERO held but the recorded AERO, and on what withdrawAll brought: its sale sold all the
+            // rest, and the failed compounding records the recorded AERO again
+            let brought = await newAero(failed);
+            let profit = await feeBase(failed);
+            let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+            let after = await feePaidReward();
+            console.log("compounding failed in withdrawAll: AERO held ", aeroBefore.toFixed(), " (recorded as fee-paid ", recorded.toFixed(), ") + brought ",
+              brought.toFixed(), ", fee base ", profit.toFixed(), "; AERO kept ", aeroKept.toFixed(), ", recorded after ", after.toFixed());
+            Utils.assertBNEq(profit, aeroBefore.plus(brought).minus(recorded));
+            Utils.assertBNEq(aeroKept, recorded);
+            assert.equal(after.toFixed(), recorded.toFixed(), "the failed compounding should keep the record");
+            // and all the LP is in the vault, none left in the strategy, which keeps the pool tokens its sale bought
+            Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+            Utils.assertBNEq(await vault.underlyingBalanceInVault(), total);
+            Utils.assertBNGt(await poolTokensHeld(), 0);
+          });
+
+          // the next withdrawAll, with the pool's mint back and nothing staked, brings no AERO (this pool's fees are paid in
+          // its own tokens) and holds only the recorded AERO: it takes no fee and sells nothing, compounds the pool tokens
+          // into LP, which goes to the vault, and clears the record. The recorded AERO stays (no pool token here)
+          let vaultLP = new BigNumber(await vault.underlyingBalanceInVault());
+          let tx = await vault.withdrawAll({ from: governance, gasPrice: keeperGasPrice });
+          let block = tx.receipt.blockNumber;
+          let minted = await mintedLP(block);
+          console.log("the next withdrawAll: AERO brought ", (await newAero(block)).toFixed(), ", fees taken ", (await strategyEvents(profitLogInReward, block)).length,
+            "; AERO kept ", (await aeroToken.balanceOf(strategy.address)).toString(), "; LP minted worth ", (await lpDollars(minted)).toFixed(), " ($, 18 decimals)");
+          assert.equal((await gaugeEvents("Withdraw", block)).length, 0, "nothing should be left to unstake");
+          assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+          assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+          Utils.assertBNEq(await newAero(block), 0);
+          assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee on the recorded AERO");
+          assert.equal((await aeroToken.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block })).length, 0,
+            "no AERO should leave the strategy");
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded);
+          assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+          Utils.assertBNGt(minted, 0);
+          Utils.assertBNEq(await vault.underlyingBalanceInVault(), vaultLP.plus(minted));
+          Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+          assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+        } finally {
+          await writeFeePaidReward(0);
+        }
+      } finally {
+        // the next hard work stakes all the LP again, also when a check above fails, so that the tests below find it staked
+        restaked = await doHardWork();
+      }
+      // and it takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      assert.equal((await gaugeEvents("Deposit", restaked)).length, 1, "should stake everything again");
+      Utils.assertBNEq(await unstakedLP(), 0);
+      Utils.assertBNEq(await feeBase(restaked), recorded.plus(await newAero(restaked)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through the exit that follows a failed compounding in the same hard work (kept unstaked), and compounds without a fee on that AERO", async function() {
+      // kept unstaked by governance (as for a gauge Aero switched off), the hard work takes the whole stake out right after
+      // its claim and its liquidation: that exit must not forget the record the compounding just before it wrote. On this
+      // pool the sale sells all the AERO, so the test writes a record below the AERO held into the strategy's storage: the
+      // sale leaves that AERO unsold, and the failed compounding records it again
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the test writes a record");
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      await mineBlocks(600); // AERO to claim and sell
+      let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+      Utils.assertBNGt(staked, 0);
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let held, leftover, block;
+      await writeFeePaidReward(recorded);
+      try {
+        try {
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+          await strategy.setKeepUnstaked(true, { from: governance });
+          try {
+            await withPoolMintFailing(async () => {
+              let failed = await doHardWork();
+              assert.equal((await gaugeEvents("EmissionsClaimed", failed)).length, 1, "should claim");
+              Utils.assertBNEq(await feeBase(failed), aeroBefore.plus(await newAero(failed)).minus(recorded));
+              assert.equal((await strategyEvents("CompoundFailed", failed)).length, 1, "the compounding should fail without reverting");
+              let unstaked = await strategyEvents("UnstakedFromGauge", failed);
+              assert.equal(unstaked.length, 1, "should take the whole stake out after the liquidation");
+              Utils.assertBNEq(unstaked[0].args.amount.toString(), staked);
+              Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+              Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded); // its sale sold all the rest
+              assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the exit should keep the record the failed compounding wrote");
+              held = await poolTokensHeld();
+            });
+          } finally {
+            await strategy.setKeepUnstaked(false, { from: governance });
+          }
+        } finally {
+          // with keepUnstaked off and the pool's mint back, the next hard work stakes all the LP again, also when a check
+          // above fails, so that the tests below find it staked
+          block = await doHardWork();
+        }
+        leftover = await poolTokensHeld();
+        console.log("exit after a failed compounding: AERO recorded as fee-paid ", recorded.toFixed(), ", kept ", (await aeroToken.balanceOf(strategy.address)).toString(),
+          "; pool tokens held ($, 18 decimals) ", held.toFixed(), " compounded without a fee into LP worth ", (await lpDollars(await mintedLP(block))).toFixed(),
+          ", left over ", leftover.toFixed(), " (", leftover.toNumber() / held.toNumber(), " of them)");
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      // it brings no AERO (nothing was staked since the exit) and holds only the recorded AERO, so it takes no fee and sells
+      // nothing: it compounds the pool tokens the failed compounding left, which clears the record
+      Utils.assertBNEq(await newAero(block), 0);
+      assert.equal((await strategyEvents(profitLogInReward, block)).length, 0, "should take no fee on the recorded AERO");
+      // the recorded AERO stays unsold: AERO is no pool token here, so nothing moves it
+      assert.equal((await aeroToken.getPastEvents("Transfer", { filter: { from: strategy.address }, fromBlock: block, toBlock: block })).length, 0,
+        "no AERO should leave the strategy");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded);
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake everything again");
+      Utils.assertBNEq(await unstakedLP(), 0);
+      // the pool tokens left below 1% of those held: measured 1.6e-6 to 3e-6 of them; compounding only after a reward sale
+      // (C5d, which fails the record check above first) leaves all of them. M5, which the volatile suite's twin of this check
+      // catches, is equivalent here: AERO is no pool token
+      Utils.assertBNGt(held, leftover.times(100));
+
+      // the next run takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      await mineBlocks(600);
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), recorded.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through a hard work that keeps new LP idle (minStakeInterval) after its compounding failed, and takes the fee once with the next one", async function() {
+      // a hard work that skips its stake (here the new LP waits for minStakeInterval after the last stake) must not touch the
+      // record its own failed compounding just wrote. On this pool the sale sells all the AERO, so the test writes a record
+      // below the AERO held into the strategy's storage, as the stale-value tests do: the sale leaves that AERO unsold, and
+      // the failed compounding records it again
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the test writes a record");
+      let lastStake = Number((await strategy.lastStakeBlock()).toString());
+      assert.notEqual(lastStake, 0, "minStakeInterval counts from the last stake");
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      await mineBlocks(600); // AERO to claim and sell
+      await depositVault(farmer2, underlying, vault, await farmer2LP(10)); // new LP, which the hard work hands to the strategy
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let aeroHeld, block;
+      await writeFeePaidReward(recorded);
+      try {
+        try {
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+          // 0 in this describe (root before()): the default keeps the next stake about a day of blocks after the last one
+          await strategy.setMinStakeInterval(432000, { from: governance });
+          try {
+            await withPoolMintFailing(async () => {
+              let failed = await doHardWork();
+              assert.isBelow(failed, lastStake + 432000, "should run long before minStakeInterval allows a stake");
+              assert.equal((await gaugeEvents("EmissionsClaimed", failed)).length, 1, "should claim");
+              Utils.assertBNEq(await feeBase(failed), aeroBefore.plus(await newAero(failed)).minus(recorded));
+              assert.equal((await strategyEvents("CompoundFailed", failed)).length, 1, "the compounding should fail without reverting");
+              // it skips the stake, with the new LP idle ...
+              let idle = new BigNumber(await underlying.balanceOf(strategy.address));
+              let skipped = await strategyEvents("StakeSkipped", failed);
+              let after = await feePaidReward();
+              console.log("stake skipped after a failed compounding: idle LP ", idle.toFixed(), "; AERO kept ", (await aeroToken.balanceOf(strategy.address)).toString(),
+                ", recorded as fee-paid ", recorded.toFixed(), " before, ", after.toFixed(), " after");
+              assert.equal((await gaugeEvents("Deposit", failed)).length, 0, "should not stake before minStakeInterval");
+              Utils.assertBNGt(idle, 0);
+              assert.equal(skipped.length, 1, "should skip the stake");
+              Utils.assertBNEq(skipped[0].args.idleAmount.toString(), idle);
+              // ... and keeps the record the failed compounding wrote
+              Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded); // its sale sold all the rest
+              assert.equal(after.toFixed(), recorded.toFixed(), "the skipped stake should keep the record the failed compounding wrote");
+            });
+          } finally {
+            await strategy.setMinStakeInterval(0, { from: governance });
+          }
+        } finally {
+          // with minStakeInterval back to 0 and the pool's mint back, the next hard work stakes all the LP, also when a check
+          // above fails, so that the tests below find it staked
+          aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+          block = await doHardWork();
+        }
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      // it takes the fee once: on all the AERO it holds but the recorded AERO (none here), and on what it brings. It sells
+      // what the fee left of that only, the recorded AERO stays (no pool token here), and the LP is all staked
+      let brought = await newAero(block);
+      let sale = await rewardSale(block);
+      let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      console.log("the next run: AERO held ", aeroHeld.toFixed(), " (recorded as fee-paid ", recorded.toFixed(), ") + brought ", brought.toFixed(), ", fee base ",
+        sale.feeBase.toFixed(), "; AERO sold ", sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left; AERO kept ", aeroKept.toFixed());
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      Utils.assertBNEq(sale.feeBase, aeroHeld.minus(recorded).plus(brought));
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the AERO not recorded as fee-paid");
+      assert.equal(aeroKept.toFixed(), recorded.toFixed(), "the recorded AERO should stay unsold");
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake everything");
+      Utils.assertBNEq(await unstakedLP(), 0);
+
+      // the next run takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), recorded.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through a user withdrawal the strategy pays from the gauge, and takes the fee once with the next hard work", async function() {
+      // a user withdrawal larger than the LP waiting in the vault has the strategy pay the rest (withdrawToVault), here from
+      // the gauge, between a failed compounding and the next hard work: it must not touch the record. On this pool the sale
+      // sells all the AERO, so the test writes a record below the AERO held into the strategy's storage, as the stale-value
+      // tests do: the sale leaves that AERO unsold, and the failed compounding records it again
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the test writes a record");
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      await mineBlocks(600); // AERO to claim and sell
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let aeroHeld, block;
+      await writeFeePaidReward(recorded);
+      try {
+        assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+        await withPoolMintFailing(async () => {
+          let failed = await doHardWork();
+          assert.equal((await strategyEvents("CompoundFailed", failed)).length, 1, "the compounding should fail without reverting");
+          Utils.assertBNEq(await feeBase(failed), aeroBefore.plus(await newAero(failed)).minus(recorded));
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded); // its sale sold all the rest
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the failed compounding should keep the record");
+        });
+
+        // farmer2 withdraws a tenth of its shares: no LP waits in the vault or in the strategy, so the vault has the strategy
+        // pay it (withdrawToVault), from the gauge. The gauge's withdraw pays out the AERO the stake earned since the claim,
+        // whose fee is not taken yet
+        await mineBlocks(600);
+        Utils.assertBNEq(await unstakedLP(), 0);
+        let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+        let shares = new BigNumber(await vault.balanceOf(farmer2)).div(10).integerValue(BigNumber.ROUND_DOWN);
+        Utils.assertBNGt(shares, 0);
+        let expected = new BigNumber(await vault.underlyingBalanceWithInvestment()).times(shares).idiv(await vault.totalSupply());
+        let farmerBefore = new BigNumber(await underlying.balanceOf(farmer2));
+        let tx = await vault.withdraw(shares.toFixed(), { from: farmer2 });
+        let withdrawal = tx.receipt.blockNumber;
+        let paid = (await gaugeEvents("EmissionsClaimed", withdrawal)).reduce((total, claim) => total.plus(claim.args._rewardAmount.toString()), new BigNumber(0));
+        console.log("user withdrawal after a failed compounding: LP ", expected.toFixed(), ", AERO the gauge paid out with it ", paid.toFixed(),
+          "; recorded as fee-paid ", recorded.toFixed(), " before, ", (await feePaidReward()).toFixed(), " after");
+        Utils.assertBNGt(expected, 0);
+        Utils.assertBNEq(new BigNumber(await underlying.balanceOf(farmer2)).minus(farmerBefore), expected);
+        let withdrawn = await gaugeEvents("Withdraw", withdrawal);
+        assert.equal(withdrawn.length, 1, "the strategy should pay the withdrawal from the gauge");
+        Utils.assertBNEq(withdrawn[0].args._amount.toString(), expected);
+        Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked.minus(expected));
+        // nothing is sold or compounded in it, and the record stays
+        assert.equal((await strategyEvents(profitLogInReward, withdrawal)).length, 0, "a user withdrawal should not sell");
+        assert.equal((await poolEvents("Mint", withdrawal, strategy.address)).length, 0, "a user withdrawal should not compound");
+        Utils.assertBNGt(paid, 0);
+        Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded.plus(paid));
+        assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "a user withdrawal should keep the record");
+
+        // the next hard work takes the fee once: on all the AERO it holds but the recorded AERO (the AERO paid out with the
+        // withdrawal), and on what it brings. It sells what the fee left of that only, the recorded AERO stays (no pool token
+        // here), and the record is cleared
+        aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        block = await doHardWork();
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      let brought = await newAero(block);
+      let sale = await rewardSale(block);
+      let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      console.log("the next hard work: AERO held ", aeroHeld.toFixed(), " (recorded as fee-paid ", recorded.toFixed(), ") + brought ", brought.toFixed(), ", fee base ",
+        sale.feeBase.toFixed(), "; AERO sold ", sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left; AERO kept ", aeroKept.toFixed());
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      Utils.assertBNEq(sale.feeBase, aeroHeld.minus(recorded).plus(brought));
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the AERO not recorded as fee-paid");
+      assert.equal(aeroKept.toFixed(), recorded.toFixed(), "the recorded AERO should stay unsold");
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake the LP minted");
+      Utils.assertBNEq(await unstakedLP(), 0);
+
+      // the next run takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), recorded.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Keeps feePaidReward through an emergency exit and continueInvesting, and takes the fee once with the next hard work", async function() {
+      // governance's emergency exit (a likely reaction to a pool whose mint fails) between a failed compounding and the next
+      // hard work takes the whole stake out and pauses investing until continueInvesting: neither may touch the record. On
+      // this pool the sale sells all the AERO, so the test writes a record below the AERO held into the strategy's storage,
+      // as the stale-value tests do: the sale leaves that AERO unsold, and the failed compounding records it again
+      assert.equal((await feePaidReward()).toFixed(), "0", "nothing should be recorded as fee-paid before the test writes a record");
+      // AERO for the record to cover: farmer2's (farmer2Aero)
+      let sent = new BigNumber("500000000000000000"); // 0.5 AERO
+      await farmer2Aero(sent);
+      await aeroToken.transfer(strategy.address, sent.toFixed(), { from: farmer2 });
+      let recorded = sent.idiv(2);
+      await mineBlocks(600); // AERO to claim and sell
+      let aeroBefore = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      let aeroHeld, block;
+      await writeFeePaidReward(recorded);
+      try {
+        assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the test should write feePaidReward into the strategy's storage");
+        await withPoolMintFailing(async () => {
+          let failed = await doHardWork();
+          assert.equal((await strategyEvents("CompoundFailed", failed)).length, 1, "the compounding should fail without reverting");
+          Utils.assertBNEq(await feeBase(failed), aeroBefore.plus(await newAero(failed)).minus(recorded));
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded); // its sale sold all the rest
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "the failed compounding should keep the record");
+        });
+
+        // the emergency exit takes the whole stake out through the gauge's normal withdraw, which pays out the AERO the
+        // stake earned since the claim (its fee not taken yet), and pauses investing; continueInvesting resumes it
+        await mineBlocks(600);
+        let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+        Utils.assertBNGt(staked, 0);
+        try {
+          let tx = await strategy.emergencyExit({ from: governance });
+          let exit = tx.receipt.blockNumber;
+          let paid = (await gaugeEvents("EmissionsClaimed", exit)).reduce((total, claim) => total.plus(claim.args._rewardAmount.toString()), new BigNumber(0));
+          console.log("emergency exit after a failed compounding: LP ", staked.toFixed(), ", AERO the gauge paid out with it ", paid.toFixed(),
+            "; recorded as fee-paid ", recorded.toFixed(), " before, ", (await feePaidReward()).toFixed(), " after");
+          let withdrawn = await gaugeEvents("Withdraw", exit);
+          assert.equal(withdrawn.length, 1, "should take the whole stake out through the normal withdraw");
+          Utils.assertBNEq(withdrawn[0].args._amount.toString(), staked);
+          assert.equal((await gaugeEvents("EmergencyWithdraw", exit)).length, 0);
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+          assert.equal(await strategy.pausedInvesting(), true);
+          // nothing is sold or compounded in it, and the record stays
+          assert.equal((await strategyEvents(profitLogInReward, exit)).length, 0, "an emergency exit should not sell");
+          assert.equal((await poolEvents("Mint", exit, strategy.address)).length, 0, "an emergency exit should not compound");
+          Utils.assertBNGt(paid, 0);
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), recorded.plus(paid));
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "an emergency exit should keep the record");
+          await strategy.continueInvesting({ from: governance });
+          assert.equal(await strategy.pausedInvesting(), false);
+          assert.equal((await feePaidReward()).toFixed(), recorded.toFixed(), "continueInvesting should keep the record");
+        } finally {
+          if (await strategy.pausedInvesting()) {
+            await strategy.continueInvesting({ from: governance });
+          }
+          // investing resumed and nothing staked: the next hard work stakes all the LP at once, also when a check above
+          // fails, so that the tests below find it staked
+          aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+          block = await doHardWork();
+        }
+        assert.equal((await feePaidReward()).toFixed(), "0", "a compounding that goes through should clear feePaidReward");
+      } finally {
+        await writeFeePaidReward(0);
+      }
+      // it takes the fee once: on all the AERO it holds but the recorded AERO (the AERO the exit paid out), and on what it
+      // brings. It sells what the fee left of that only, the recorded AERO stays (no pool token here), and the LP is all
+      // staked again
+      let brought = await newAero(block);
+      let sale = await rewardSale(block);
+      let aeroKept = new BigNumber(await aeroToken.balanceOf(strategy.address));
+      console.log("the first hard work after continueInvesting: AERO held ", aeroHeld.toFixed(), " (recorded as fee-paid ", recorded.toFixed(), ") + brought ",
+        brought.toFixed(), ", fee base ", sale.feeBase.toFixed(), "; AERO sold ", sale.sold.toFixed(), " of the ", sale.split.toFixed(), " the fee left; AERO kept ",
+        aeroKept.toFixed());
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+      Utils.assertBNEq(sale.feeBase, aeroHeld.minus(recorded).plus(brought));
+      assert.equal(sale.sold.toFixed(), sale.split.toFixed(), "the sale should sell all that the fee left of the AERO not recorded as fee-paid");
+      assert.equal(aeroKept.toFixed(), recorded.toFixed(), "the recorded AERO should stay unsold");
+      assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1, "should compound the pool tokens left");
+      assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake all the LP again");
+      Utils.assertBNEq(await unstakedLP(), 0);
+
+      // the next run takes the fee on that AERO, no longer recorded, and on what it brings, and sells all of it
+      block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      Utils.assertBNEq(await feeBase(block), recorded.plus(await newAero(block)));
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
+      assert.equal((await feePaidReward()).toFixed(), "0");
+    });
+
+    it("Reverts the hard work when the zap's swap fails Aero's gas check, while withdrawAll completes without the compounding", async function() {
+      // selling off and only pool tokens to compound: the zap's swap is the hard work's first swap through the pool, and
+      // fails Aero's pool tape gas check (as if the keeper had sent too little gas there). Re-raised from the compounding
+      // as from the AERO sale, it reverts the hard work, so that the keeper retries with more gas
+      await strategy.setSell(false, { from: governance });
+      try {
+        let usdcIn = (await burnLP(2000))[0];
+        await usdcToken.transfer(strategy.address, usdcIn.toFixed(), { from: farmer2 });
+        await mineBlocks(600); // AERO to claim
+        let staked = new BigNumber(await gauge.balanceOf(strategy.address));
+        Utils.assertBNGt(staked, 0);
+        let before = await gaugeCheckpoint();
+        let usdcHeld = new BigNumber(await usdcToken.balanceOf(strategy.address));
+        let aeroHeld = new BigNumber(await aeroToken.balanceOf(strategy.address));
+        await withPoolTapeFailing(poolFactory.address, async () => {
+          let message = await revertMessage(controller.doHardWork(vault.address, { from: governance, gasPrice: keeperGasPrice }),
+            "the hard work should revert when its zap fails Aero's gas check");
+          assert.include(message, revertData(insufficientGasError), "the hard work should revert with Aero's gas check error");
+          Utils.assertBNEq(await gauge.userRewardPerTokenPaid(strategy.address), before.paid); // nothing claimed
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), staked);
+          Utils.assertBNEq(await usdcToken.balanceOf(strategy.address), usdcHeld);
+          Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), aeroHeld);
+
+          // withdrawAll goes on without the compounding: it hands all the LP to the vault, and the USDC waits
+          let total = new BigNumber(await vault.underlyingBalanceWithInvestment());
+          let tx = await vault.withdrawAll({ from: governance, gasPrice: keeperGasPrice });
+          let failures = await strategyEvents("LiquidationFailed", tx.receipt.blockNumber);
+          assert.equal(failures.length, 1, "the liquidation should fail without reverting withdrawAll");
+          assert.equal(failures[0].args.reason, insufficientGasError, "Aero's gas check error, from the compounding");
+          assert.equal((await strategyEvents("CompoundFailed", tx.receipt.blockNumber)).length, 0, "Aero's gas check error is no compounding failure");
+          Utils.assertBNEq(await gauge.balanceOf(strategy.address), 0);
+          Utils.assertBNEq(await underlying.balanceOf(strategy.address), 0);
+          Utils.assertBNGte(await vault.underlyingBalanceInVault(), total);
+          Utils.assertBNGte(await usdcToken.balanceOf(strategy.address), usdcHeld);
+        });
+
+        // with Aero's gas limit back, the next hard work stakes all the LP again, and zaps the USDC
+        let block = await doHardWork();
+        assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+        assert.equal((await strategyEvents("CompoundFailed", block)).length, 0);
+        assert.equal((await poolEvents("Swap", block, strategy.address)).length, 1, "should zap the USDC");
+        assert.equal((await poolEvents("Mint", block, strategy.address)).length, 1);
+        assert.equal((await gaugeEvents("Deposit", block)).length, 1, "should stake everything again");
+        Utils.assertBNEq(await unstakedLP(), 0);
+      } finally {
+        await strategy.setSell(true, { from: governance });
+      }
+
+      // selling is back on: the next hard work sells the AERO kept while it was off, all of it (no pool token is AERO)
+      let block = await doHardWork();
+      assert.equal((await strategyEvents("LiquidationFailed", block)).length, 0);
+      assert.equal((await strategyEvents(profitLogInReward, block)).length, 1, "should sell the AERO kept");
+      Utils.assertBNEq(await aeroToken.balanceOf(strategy.address), 0);
     });
   });
 
@@ -4144,6 +6373,18 @@ describe("Base Mainnet AerodromeV2 Stable USDC-alUSDb", function() {
       // the revert came from the gauge check, not from the initializer: the same proxy accepts the pool's own gauge
       await freshStrategy.initializeBaseStrategy(addresses.Storage, underlying.address, vault.address, gaugeAddress, aero, { from: governance });
       assert.equal((await freshStrategy.rewardPool()).toLowerCase(), gaugeAddress.toLowerCase());
+    });
+
+    it("Fits the strategy's code within EIP-170's 24,576 bytes", async function() {
+      // hardhat.config.js lets the test network deploy contracts of any size (allowUnlimitedContractSize), so no other test
+      // would notice the strategy growing past what Base deploys
+      let implementation = await (await StrategyProxy.at(strategy.address)).implementation();
+      let deployed = (await web3.eth.getCode(implementation)).length / 2 - 1;
+      let built = Strategy.deployedBytecode.length / 2 - 1;
+      console.log("deployed code of the strategy implementation (", Strategy.contractName, "): ", deployed, " bytes (artifact: ", built,
+        "), ", 24576 - deployed, " below EIP-170's limit");
+      assert.equal(deployed, built, "the proxy should run the implementation built from this artifact");
+      assert.isAtMost(deployed, 24576, "the strategy should fit within EIP-170's contract size limit");
     });
   });
 });
